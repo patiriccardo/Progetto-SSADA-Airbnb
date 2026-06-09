@@ -13,10 +13,10 @@ Progetto-SSADA-Airbnb/
 ├── Analisi/
 │   ├── Modellazione.Rmd              # Modellazione predittiva (GBM, RF, GAM, MERT, Ensemble)
 │   ├── Descrittive.Rmd               # Analisi descrittive degli annunci
-│   ├── Diffusione.Rmd                # Serie storica della crescita degli host
+│   ├── Diffusione.Rmd                # Modelli di diffusione applicati agli host
 │   ├── RegoleAssociative.Rmd         # Market basket analysis delle amenities
 │   ├── mappe.Rmd                     # Mappe interattive Leaflet
-│   ├── Mappe2.R                      # Mappe geospaziali avanzate
+│   ├── Mappe2.R                      # Mappe geospaziali 
 │   ├── Pulizia.R                     # Pulizia e preprocessing del dataset Airbnb principale
 │   ├── pulizia_airroi.R              # Preprocessing del dataset AirROI
 │   ├── utils.R                       # Funzione MERT (Mixed Effects Regression Trees)
