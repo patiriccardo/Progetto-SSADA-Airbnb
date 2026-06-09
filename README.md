@@ -17,6 +17,7 @@ Progetto-SSADA-Airbnb/
 │   ├── RegoleAssociative.Rmd         # Market basket analysis delle amenities
 │   ├── mappe.Rmd                     # Mappe interattive Leaflet
 │   ├── Mappe2.R                      # Mappe geospaziali avanzate
+│   ├── Pulizia.R                     # Pulizia e preprocessing del dataset Airbnb principale
 │   ├── pulizia_airroi.R              # Preprocessing del dataset AirROI
 │   ├── utils.R                       # Funzione MERT (Mixed Effects Regression Trees)
 │   ├── scraping_airbnb.py            # Web scraping prezzi Airbnb – Lido di Venezia
@@ -96,6 +97,8 @@ install.packages(c(
   "sf", "ggspatial", "viridis", "leaflet",
   # Serie storiche
   "forecast", "prophet",
+  # Analisi testuale (Pulizia.R)
+  "tidytext", "textstem", "quanteda", "ggwordcloud",
   # Regole associative
   "arules", "arulesViz",
   # Output
@@ -138,7 +141,10 @@ Aprire i file `.Rmd` dalla cartella `Analisi/` e cliccare **Knit**:
 ### 3. Script di supporto (dalla root del progetto)
 
 ```r
-# Ricrea dati/airroi_pulito.Rdata a partire da listings.parquet
+# Passo 1 – ricrea dati/airbnb_pulito.Rdata a partire da dati/airbnb.Rdata
+source("Analisi/Pulizia.R")
+
+# Passo 2 – ricrea dati/airroi_pulito.Rdata a partire da dati/listings.parquet
 source("Analisi/pulizia_airroi.R")
 
 # Genera le mappe geospaziali avanzate
