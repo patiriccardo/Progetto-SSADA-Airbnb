@@ -47,3 +47,21 @@ po/*~
 
 # RStudio Connect folder
 rsconnect/
+
+# ── File troppo grandi per GitHub (>50 MB) ─────────────────────────────────
+dati/reviews.csv
+Modelli/modello_merf_finale_rfsrc.rds
+Modelli/modello_rf_finale_rfsrc.rds
+Modelli/modello_metboost_finale_na_def1.rds
+
+# ── Cache OSM tile (generata automaticamente da ggspatial/rosm) ─────────────
+Analisi/rosm.cache/
+
+# ── File residui senza estensione (duplicati di .Rdata/.gz) ─────────────────
+dati/airroi_pulito
+dati/airbnb_pulito2
+dati/airroi_pulito.gz
+
+# ── File di sistema macOS ────────────────────────────────────────────────────
+.DS_Store
+**/.DS_Store

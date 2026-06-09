@@ -1,0 +1,904 @@
+---
+title: "Analisi della Diffusione degli Host Airbnb a Venezia"
+author: "Riccardo Pati"
+date: "2026-06-04"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+    latex_engine: xelatex
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,       # visibile ma collassabile (code_folding: hide)
+  message = FALSE,
+  warning = FALSE,
+  fig.width  = 9,
+  fig.height = 5.2,     # rapporto 16:9 per le slide
+  dpi = 150
+)
+```
+
+```{r librerie}
+library(tidyverse)
+library(lubridate)
+library(scales)
+library(here)
+library(DIMORA)
+library(forecast)
+library(prophet)
+```
+
+```{r tema, include=FALSE}
+# ── Palette e tema condivisi ──────────────────────────────────────────────────
+pal_venezia <- c(
+  "#0D0D0D",  # [1] Nero Venezia        — linee principali, testo
+  "#006241",  # [2] Verde Venezia       — aree di riempimento, fill
+  "#F36F21",  # [3] Arancione Venezia   — accenti, barre, evidenze
+  "#1A1A1A",  # [4] Nero scuro variante — sfondi, contorni
+  "#004B28",  # [5] Verde scuro         — linee secondarie
+  "#D4581A"   # [6] Arancione scuro     — linee secondarie
+)
+
+tema_venezia <- theme_minimal(base_size = 13) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 15),
+    plot.subtitle    = element_text(color = "grey30"),
+    plot.caption     = element_text(color = "grey45", size = 9, hjust = 0),
+    legend.position  = "top",
+    panel.background = element_rect(fill='transparent'),
+    plot.background = element_rect(fill='transparent', color=NA),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.background = element_rect(fill='transparent'),
+    legend.box.background = element_rect(fill='transparent')
+  )
+theme_set(tema_venezia)
+
+cap_inside <- "Fonte: Inside Airbnb – elaborazione propria"
+
+# Helper: salva PNG slide-ready in analisi/grafici/
+dir.create("../grafici", showWarnings = FALSE)
+salva <- function(nome, p = last_plot(), w = 9, h = 5.2)
+  ggsave(file.path("grafici", paste0(nome, ".png")),
+         p, width = w, height = h, dpi = 300, bg = "white")
+```
+
+```{r carico-dati}
+load(here("dati", "airbnb_pulito.Rdata"))
+load(here("dati", "airroi_pulito.Rdata"))
+```
+
+# Grafici esplorativi
+
+L'analisi prende come unità di osservazione gli **host locali** (soggetti residenti
+nel Comune di Venezia che hanno aperto almeno un annuncio su Airbnb) ricostruendone
+la storia di iscrizione anno per anno. Due grafici complementari permettono di
+leggere il fenomeno su scale diverse: la curva cumulata rivela la forma strutturale
+del processo, quella istantanea ne evidenzia la velocità in ogni singolo anno.
+
+```{r cumulate - istantanee}
+# Dato base condiviso 
+host_locale_base <- airbnb_pulito %>%
+  mutate(data_iscrizione = as.Date(host_since, origin = "1970-01-01")) %>%
+  filter(!is.na(data_iscrizione), host_is_local == 1)
+
+#Cumulata 
+p1c <- host_locale_base %>%
+  count(data_iscrizione) %>%
+  arrange(data_iscrizione) %>%
+  mutate(host_cumulati = cumsum(n)) %>%
+  ggplot(aes(data_iscrizione, host_cumulati)) +
+  geom_area(fill = pal_venezia[2], alpha = 0.25) +
+  geom_line(color = pal_venezia[1], linewidth = 1.2) +
+  scale_y_continuous(limits = c(0, NA), labels = comma_format()) +
+  labs(
+    title    = "Crescita cumulata degli host locali nel tempo",
+    subtitle = "La forma a S e' il segnale di un processo di diffusione",
+    x = NULL, y = "Host cumulati", caption = cap_inside
+  ) +
+  tema_venezia
+
+#Istantanea annuale
+p1i <- host_locale_base %>%
+  mutate(anno = year(data_iscrizione)) %>%
+  count(anno) %>%
+  ggplot(aes(anno, n)) +
+  geom_col(fill = pal_venezia[3], alpha = 0.85, width = 0.7) +
+  geom_line(color = pal_venezia[1], linewidth = 1.0) +
+  geom_point(color = pal_venezia[1], size = 2.5, shape = 21,
+             fill = pal_venezia[3], stroke = 1.2) +
+  scale_x_continuous(breaks = scales::pretty_breaks(n = 8)) +
+  scale_y_continuous(labels = comma_format()) +
+  labs(
+    title    = "Nuovi host locali per anno",
+    subtitle = "Picco di iscrizioni e successivo rallentamento post-pandemia",
+    x = NULL, y = "Nuovi host", caption = cap_inside
+  ) +
+  tema_venezia
+
+p1c
+p1i
+```
+
+La curva cumulata disegna una **forma a S** caratteristica: crescita lenta nella
+fase di lancio (prima metà degli anni 2010), accelerazione marcata nel periodo
+2014–2018 coincidente con il boom del turismo lagunare, quindi una decelerazione
+evidente dopo il 2019. L'istantanea conferma il picco di nuove iscrizioni collocato
+tra il 2016 e il 2018, seguito da un crollo netto nel 2020–2021 imputabile alla
+pandemia COVID-19, che ha di fatto azzerato la domanda turistica a Venezia per
+due stagioni consecutive. Questi elementi sono i segnali diagnostici che giustificano
+l'applicazione di un modello di diffusione di tipo Bass.
+
+# Bass Standard
+```{r Bass Standard Model}
+n_host <- host_locale_base %>%
+  mutate(anno = year(data_iscrizione)) %>%
+  count(anno) %>% pull(n)
+
+bm_host <- BM(n_host,display = T)
+
+summary(bm_host)
+```
+
+Il modello stima tre parametri: il potenziale di mercato $m$, il coefficiente di
+innovazione $p = 0.019$ e il coefficiente di imitazione $q = 0.447$. Tutti e tre
+risultano statisticamente significativi, confermando che il processo di adozione
+è identificabile nei dati.
+
+Il confronto tra $p$ e $q$, con $p \ll q$, indica una dinamica prevalentemente
+**imitativa**: i nuovi host si iscrivono principalmente dopo aver osservato il
+comportamento di host già attivi, non per effetto di comunicazione esterna
+(pubblicità, media). Questo è coerente con la natura di Airbnb, piattaforma in cui
+il passaparola e la visibilità dei vicini che affittano costituisce il principale
+canale di diffusione.
+
+L'R² elevato (calcolato sui dati cumulati) non è di per sé informativo: la natura monotona della cumulata rende quasi qualunque modello con trend crescente capace di ottenere un buon fit su questa scala. La diagnostica reale va condotta sui **residui dei dati istantanei**.
+
+## Diagnostica Bass Standard
+```{r diagnostica BS}
+# Ricava l'indice temporale per mappare anni → t
+tabella_anni <- host_locale_base %>%
+  mutate(anno = year(data_iscrizione)) %>%
+  count(anno) %>%
+  mutate(t = row_number())
+
+# Confronto grafico Bass Standard: fitted vs osservati
+fit_bm_inst <- make.instantaneous(fitted(bm_host))
+
+anni_seq <- tabella_anni$anno
+
+plot(anni_seq, n_host, type = "b", pch = 16, lty = 3, cex = 0.7,
+     xlab = "Anno", ylab = "Nuovi host locali",
+     main = "Bass Standard: fitted vs osservati")
+lines(anni_seq, fit_bm_inst, lwd = 2, col = 2)
+
+# ACF dei residui
+acf(residuals(bm_host), main = "ACF residui – Bass Standard")
+```
+
+Il confronto tra curva stimata e dati osservati rivela un **sistematico
+sottostima nella fase iniziale** (2009–2013): il modello di Bass standard
+presuppone che le prime adozioni avvengano esclusivamente per innovazione esogena
+a ritmo costante $p$, mentre nella realtà le iscrizioni si concentrano
+in un sottoinsieme di pionieri con caratteristiche specifiche. L'ACF dei residui
+indica la presenza di **autocorrelazione positiva ai primi ritardi**, segno che
+il modello non cattura tutta la struttura dinamica della serie.
+
+# Bass Generalizzato con shock rettangolare
+```{r Bass Generalizzato con shock rettangolare}
+
+GBMr1_host<- GBM(n_host, shock = "rett", nshock = 1,
+              prelimestimates = c(coef(bm_host)[1], coef(bm_host)[2], coef(bm_host)[3], 3, 9, -0.1))
+summary(GBMr1_host)
+
+```
+
+## Diagnostica Bass Generalizzato con shock rettangolare
+```{r Diagnostica Bass Generalizzato con shock rettangolare}
+fit_gbmr_inst <- make.instantaneous(fitted(GBMr1_host))
+
+plot(anni_seq, n_host, type = "b", pch = 16, lty = 3, cex = 0.7,
+     xlab = "Anno", ylab = "Nuovi host locali", ylim = c(0,500),
+     main = "GBM rettangolare: fitted vs osservati")
+lines(anni_seq, fit_gbmr_inst, lwd = 2, col = 2)
+lines(anni_seq, fit_bm_inst,   lwd = 2, col = 3, lty = 2)
+legend("topright", c("GBM rettangolare", "Bass Standard"),
+       col = c(2, 3), lty = c(1, 2), lwd = 2, bty = "n")
+
+acf(residuals(GBMr1_host), main = "ACF residui – GBM rettangolare")
+```
+
+Il GBM con impulso rettangolare introduce una **perturbazione temporanea** sul
+potenziale di mercato nell'intervallo $[2011, 2017]$, scalandolo di un fattore
+$(1 + c_1)$. La significatività del parametro $c_1$ conferma che lo shock è
+statisticamente identificabile nei dati: il modello riconosce una discontinuità
+nel ritmo di adozione nell'arco temporale specificato.
+
+Il fit visivo sulle istantanee mostra un miglioramento rispetto al Bass standard,
+in particolare nella zona di perturbazione. Tuttavia, la natura dell'impulso
+rettangolare, attivo in modo uniforme per tutta la durata $[a, b]$ e poi
+completamente assente, lo rende poco adatto a descrivere shock con intensità
+variabile nel tempo, come la crisi pandemica che ha avuto un effetto più acuto
+nel primo anno (2020) rispetto al secondo (2021). L'ACF dei residui permette di
+valutare se la struttura dinamica residua è stata ridotta rispetto al Bass
+standard.
+
+# Bass Generalizzato con shock esponenziale
+```{r Bass Generalizzato con shock esponenziale}
+
+GBMe1_host<- GBM(n_host, shock = "exp", nshock = 1,
+              prelimestimates = c(coef(bm_host)[1], coef(bm_host)[2], coef(bm_host)[3], 2,-0.4,0.3))
+
+summary(GBMe1_host)
+```
+
+## Diagnostica Bass Generalizzato con shock esponenziale
+```{r diagnostica GBM esponenziale}
+fit_gbme_inst <- make.instantaneous(fitted(GBMe1_host))
+
+plot(anni_seq, n_host, type = "b", pch = 16, lty = 3, cex = 0.7,
+     xlab = "Anno", ylab = "Nuovi host locali",
+     main = "GBM esponenziale: fitted vs osservati")
+lines(anni_seq, fit_gbme_inst, lwd = 2, col = 2)
+lines(anni_seq, fit_bm_inst,   lwd = 2, col = 3, lty = 2)
+legend("topright", c("GBM esponenziale", "Bass Standard"),
+       col = c(2, 3), lty = c(1, 2), lwd = 2, bty = "n")
+
+acf(residuals(GBMe1_host), main = "ACF residui – GBM esponenziale")
+```
+
+Il GBM con shock esponenziale modella una perturbazione che nasce al tempo $a$
+con intensità $c$ e decade poi con velocità $|b|$ (memoria dello shock). La
+non-significatività di $p$ e $q$ non è un segnale di cattivo modello: quando
+lo shock esponenziale è attivo fin dai primi periodi, esso assorbe parte della
+struttura di innovazione e imitazione, rendendo difficile la separazione dei
+contributi. Il coefficiente $b < 0$ conferma che l'effetto della perturbazione
+si riduce nel tempo, compatibile con una crisi transitoria.
+
+A livello grafico il modello descrive meglio la traiettoria nella fase iniziale
+e nella zona di decelerazione post-picco. La sua principale limitazione è
+l'**instabilità delle stime** di $m$, $p$ e $q$: con parametri non
+significativi, le previsioni OOS di lungo periodo risultano meno affidabili.
+
+# GGM
+```{r GGM}
+# Il GGM introduce un potenziale di mercato dinamico tramite due canali
+# di comunicazione aggiuntivi (p_c, q_c), catturando meglio la fase iniziale
+# della curva senza ricorrere a uno shock esterno
+# Ordine prelimestimates: m, p_c, q_c, p, q
+ggm_host <- GGM(n_host,
+                prelimestimates = c(coef(bm_host)[1], 0.01, 0.01,
+                                    coef(bm_host)[2], coef(bm_host)[3]))
+summary(ggm_host)
+```
+
+## Diagnostica GGM
+```{r diagnostica GGM}
+fit_ggm_inst <- make.instantaneous(fitted(ggm_host))
+
+plot(anni_seq, n_host, type = "b", pch = 16, lty = 3, cex = 0.7,
+     xlab = "Anno", ylab = "Nuovi host locali", ylim = c(0, 500),
+     main = "GGM: fitted vs osservati")
+lines(anni_seq, fit_ggm_inst, lwd = 2, col = 2)
+lines(anni_seq, fit_bm_inst,  lwd = 2, col = 3, lty = 2)
+legend("topright", c("GGM", "Bass Standard"),
+       col = c(2, 3), lty = c(1, 2), lwd = 2, bty = "n")
+
+acf(residuals(ggm_host), main = "ACF residui – GGM")
+```
+
+Il GGM estende il Bass standard introducendo un **potenziale di mercato
+dinamico**: oltre ai canali individuali ($p$, $q$), il modello aggiunge due
+canali di comunicazione collettiva ($p_c$, $q_c$) che accelerano o frenano
+la diffusione attraverso i media e il passaparola aggregato.
+
+La significatività di $q_c$ conferma un meccanismo imitativo
+a livello di comunicazione, plausibile per Airbnb Venezia:
+l'effetto notizia ha amplificato la consapevolezza della piattaforma in modo discontinuo nel tempo.
+
+Il miglioramento del fit nella fase iniziale rispetto al Bass standard è atteso:
+i parametri $p_c$ e $q_c$ permettono al modello di allocare più massa
+probabilistica nei periodi di lancio. Se i parametri di comunicazione risultano
+non significativi, il GGM collassa al Bass standard e la complessità aggiuntiva
+non è giustificata dai dati. L'ACF dei residui è il criterio finale per
+scegliere tra i due.
+
+# Confronto tra modelli
+
+I modelli stimati si confrontano su due indicatori calcolati sulle **serie
+istantanee** (più informative delle cumulate per valutare l'aderenza al
+dato osservato anno per anno):
+
+- **R̃²_parziale** rispetto al Bass: quantifica il guadagno **marginale**
+  introdotto dai parametri aggiuntivi di ciascun modello rispetto al Bass
+  standard, calcolato come
+  $$\tilde{R}^2 =
+      \frac{R^2_{\text{modello}} - R^2_{\text{Bass}}}
+           {1 - R^2_{\text{Bass}}}$$
+
+```{r r2-confronto}
+# ── Helper: R̃² istantaneo ──────────────────────────────────────────────────
+r2_inst <- function(model, data) {
+  fit   <- make.instantaneous(fitted(model))
+  ss_r  <- sum((data - fit)^2)
+  ss_t  <- sum((data - mean(data))^2)
+  round(1 - ss_r / ss_t, 4)
+}
+
+# ── Helper: R² cumulato ────────────────────────────────────────────────────
+r2_cum <- function(model, data) {
+  fit_c <- as.numeric(fitted(model))
+  cum_o <- cumsum(data)
+  ss_r  <- sum((cum_o - fit_c)^2)
+  ss_t  <- sum((cum_o - mean(cum_o))^2)
+  round(1 - ss_r / ss_t, 4)
+}
+
+# ── Calcolo ────────────────────────────────────────────────────────────────
+r2i_bass  <- r2_inst(bm_host,    n_host)   # 0.8133
+r2i_gbmr  <- r2_inst(GBMr1_host, n_host)   # 0.8839
+r2i_gbme  <- r2_inst(GBMe1_host, n_host)   # 0.9498
+r2i_ggm   <- r2_inst(ggm_host,   n_host)   # 0.9212
+
+r2c_bass  <- r2_cum(bm_host,    n_host)
+r2c_gbmr  <- r2_cum(GBMr1_host, n_host)
+r2c_gbme  <- r2_cum(GBMe1_host, n_host)
+r2c_ggm   <- r2_cum(ggm_host,   n_host)
+
+# R̃²_parziale rispetto al Bass (base di riferimento)
+r2p_gbmr  <- round((r2i_gbmr - r2i_bass) / (1 - r2i_bass), 4)  # 0.3781
+r2p_gbme  <- round((r2i_gbme - r2i_bass) / (1 - r2i_bass), 4)  # 0.7311
+r2p_ggm   <- round((r2i_ggm  - r2i_bass) / (1 - r2i_bass), 4)  # 0.5779
+
+# ── Tabella comparativa ────────────────────────────────────────────────────
+r2_tabella <- data.frame(
+  Modello     = c("Bass Standard",
+                  "GBM – Shock Rettangolare",
+                  "GBM – Shock Esponenziale",
+                  "GGM (Guseo-Guidolin)"),
+  R2_cum      = c(r2c_bass,  r2c_gbmr,  r2c_gbme,  r2c_ggm),
+  R2_ist      = c(r2i_bass,  r2i_gbmr,  r2i_gbme,  r2i_ggm),
+  R2_parz     = c("-",       r2p_gbmr,  r2p_gbme,  r2p_ggm)
+)
+
+knitr::kable(
+  r2_tabella,
+  col.names = c("Modello",
+                "$R^2$ (cumulato)",
+                "$\\tilde{R}^2$ (istantaneo)",
+                "$\\tilde{R}^2$ parziale vs Bass"),
+  align  = "lccc",
+  digits = 4,
+  escape = FALSE,
+  caption = "Confronto tra modelli di diffusione"
+)
+```
+
+Il **GBM esponenziale** ottiene il miglior R̃² istantaneo (0.9498) e il più alto
+R̃²_parziale (0.7311), indicando che lo shock esponenziale recupera il 73% della
+varianza residua del Bass. Il **GGM** raggiunge R̃² = 0.9212 con soli 5 parametri
+tutti significativi, costituendo il miglior compromesso tra fit e parsimonia.
+Il **GBM rettangolare** migliora il Bass in modo più modesto (R̃²_parz = 0.3781),
+ma mantiene la piena significatività statistica di tutti i coefficienti.
+
+# Validazione: stima su 2009–2021, verifica su 2022–2025
+
+L'analisi in-sample (R̃²) valuta quanto i modelli aderiscono ai dati su
+cui sono stati stimati — una misura di fit, non di capacità previsiva.
+Per testare quest'ultima si divide la serie in due blocchi:
+
+- **Stima** (2009–2021, $T_s = 13$ osservazioni): include la fase di lancio,
+  il picco e il crollo pandemico; i modelli vengono ri-stimati su questo solo
+  sottoinsieme.
+- **Verifica** (2022–2025, $T_v = 4$ osservazioni): anni non visti durante la
+  stima, sui quali si calcolano gli errori di previsione.
+
+La scelta del punto di taglio al 2021 è intenzionale: il periodo di verifica
+è interamente post-pandemico, il che permette di valutare se i modelli, stimati *includendo* lo shock COVID, riescono a proiettare correttamente la
+ripresa parziale e il successivo rallentamento.
+
+## Stima dei modelli sull'insieme di stima
+
+```{r stima-verifica-fit}
+# ── Definizione dei blocchi ───────────────────────────────────────────────────
+anno_cut  <- 2021
+T_s       <- sum(anni_seq <= anno_cut)         # 13 (2009–2021)
+T_v       <- length(n_host) - T_s              # 4  (2022–2025)
+
+n_stima   <- n_host[seq_len(T_s)]
+n_verif   <- n_host[(T_s + 1):length(n_host)]
+anni_stima <- anni_seq[seq_len(T_s)]
+anni_verif <- anni_seq[(T_s + 1):length(anni_seq)]
+
+# ── Re-stima su n_stima ───────────────────────────────────────────────────────
+bm_sv   <- BM(n_stima, display = FALSE)
+GBMr_sv <- GBM(n_stima, shock = "rett", nshock = 1,
+                prelimestimates = c(coef(bm_sv)[1], coef(bm_sv)[2],
+                                    coef(bm_sv)[3], 3, 9, -0.1),
+                display = FALSE)
+GBMe_sv <- GBM(n_stima, shock = "exp", nshock = 1,
+                prelimestimates = c(coef(bm_sv)[1], coef(bm_sv)[2],
+                                    coef(bm_sv)[3], 2, -0.4, 0.3),
+                display = FALSE)
+ggm_sv  <- GGM(n_stima,
+               prelimestimates = c(coef(bm_sv)[1], 0.01, 0.01,
+                                   coef(bm_sv)[2], coef(bm_sv)[3]),
+               display = FALSE)
+
+# Riepilogo parametri stimati
+cat("── Bass (stima) ──\n"); print(round(coef(bm_sv), 5))
+cat("── GGM  (stima) ──\n"); print(round(coef(ggm_sv), 5))
+```
+
+## Previsioni sull'insieme di verifica
+
+```{r stima-verifica-pred}
+# ── Previsioni istantanee per l'intero orizzonte (stima + verifica) ───────────
+T_tot <- T_s + T_v   # 17
+
+pred_bm_v   <- tail(make.instantaneous(predict(bm_sv,   newx = 1:T_tot)), T_v)
+pred_gbmr_v <- tail(make.instantaneous(predict(GBMr_sv, newx = 1:T_tot)), T_v)
+pred_gbme_v <- tail(make.instantaneous(predict(GBMe_sv, newx = 1:T_tot)), T_v)
+pred_ggm_v  <- tail(make.instantaneous(predict(ggm_sv,  newx = 1:T_tot)), T_v)
+
+# ── Grafico: fitted in-sample + previsioni OOS a confronto con osservati ──────
+fit_bm_s   <- make.instantaneous(fitted(bm_sv))
+fit_ggm_s  <- make.instantaneous(fitted(ggm_sv))
+
+ylim_v <- c(0, max(n_host) * 1.1)
+
+plot(anni_stima, n_stima,
+     type = "b", pch = 16, lty = 3, cex = 0.8, col = 1,
+     xlim = c(min(anni_seq), max(anni_verif)),
+     ylim = ylim_v,
+     xlab = "Anno", ylab = "Nuovi host locali",
+     main = "Stima vs verifica: tutti i modelli")
+
+# osservati verifica
+points(anni_verif, n_verif, pch = 17, cex = 1, col = 1)
+
+# linea di taglio
+abline(v = anno_cut + 0.5, lty = 2, col = "grey50")
+
+# fitted in-sample (solo GGM per leggibilità)
+lines(anni_stima, fit_ggm_s,  lwd = 1.5, col = pal_venezia[3], lty = 2)
+lines(anni_stima, fit_bm_s,   lwd = 1.5, col = "grey60",       lty = 2)
+
+# previsioni verifica
+lines(anni_verif, pred_bm_v,   lwd = 2, col = "grey60",       lty = 1)
+lines(anni_verif, pred_gbmr_v, lwd = 2, col = pal_venezia[5], lty = 1)
+lines(anni_verif, pred_gbme_v, lwd = 2, col = pal_venezia[6], lty = 1)
+lines(anni_verif, pred_ggm_v,  lwd = 2, col = pal_venezia[3], lty = 1)
+
+legend("topright",
+       legend = c("Osservati (stima)", "Osservati (verifica)",
+                  "Bass", "GBM rett.", "GBM exp.", "GGM"),
+       col    = c(1, 1, "grey60", pal_venezia[5], pal_venezia[6], pal_venezia[3]),
+       pch    = c(16, 17, NA, NA, NA, NA),
+       lty    = c(NA, NA, 1, 1, 1, 1),
+       lwd    = c(NA, NA, 2, 2, 2, 2),
+       bty = "n", cex = 0.75)
+```
+
+## Errori di previsione
+
+```{r stima-verifica-errori}
+# ── Metriche ──────────────────────────────────────────────────────────────────
+mae_  <- function(o, p) mean(abs(o - p))
+rmse_ <- function(o, p) sqrt(mean((o - p)^2))
+mape_ <- function(o, p) mean(abs((o - p) / o)) * 100
+
+# ── Previsioni anno per anno (tabella dettaglio) ──────────────────────────────
+detail <- data.frame(
+  Anno    = anni_verif,
+  Osserv. = n_verif,
+  Bass    = round(pred_bm_v),
+  GBM_r   = round(pred_gbmr_v),
+  GBM_e   = round(pred_gbme_v),
+  GGM     = round(pred_ggm_v)
+)
+
+knitr::kable(detail,
+  col.names = c("Anno", "Osservato", "Bass", "GBM rett.", "GBM exp.", "GGM"),
+  align = "cccccc",
+  caption = "Previsioni vs osservati nel periodo di verifica (2022–2025)")
+
+# ── Tabella riassuntiva degli errori ─────────────────────────────────────────
+err_tab <- data.frame(
+  Modello = c("Bass Standard",
+              "GBM – Shock Rettangolare",
+              "GBM – Shock Esponenziale",
+              "GGM (Guseo-Guidolin)"),
+  MAE  = c(mae_ (n_verif, pred_bm_v),
+           mae_ (n_verif, pred_gbmr_v),
+           mae_ (n_verif, pred_gbme_v),
+           mae_ (n_verif, pred_ggm_v)),
+  RMSE = c(rmse_(n_verif, pred_bm_v),
+           rmse_(n_verif, pred_gbmr_v),
+           rmse_(n_verif, pred_gbme_v),
+           rmse_(n_verif, pred_ggm_v)),
+  MAPE = c(mape_(n_verif, pred_bm_v),
+           mape_(n_verif, pred_gbmr_v),
+           mape_(n_verif, pred_gbme_v),
+           mape_(n_verif, pred_ggm_v))
+)
+
+# Evidenzio il miglior modello per ogni metrica
+best <- apply(err_tab[, -1], 2, which.min)
+
+knitr::kable(
+  err_tab,
+  col.names = c("Modello", "MAE", "RMSE", "MAPE (%)"),
+  digits  = 2,
+  align   = "lccc",
+  caption = "Errori di previsione sul periodo di verifica (2022–2025)"
+)
+```
+
+Il **MAE** misura l'errore medio assoluto in unità (nuovi host/anno); il
+**RMSE** penalizza maggiormente gli errori grandi; il **MAPE** esprime
+l'errore in percentuale del valore osservato ed è utile per confrontare
+modelli su scale diverse.
+
+Da notare che con soli $T_v = 4$ anni di verifica le stime degli errori
+hanno varianza elevata: una singola osservazione anomala può spostare
+sensibilmente le classifiche. Le metriche vanno interpretate come
+indicazioni di tendenza, non come ranking definitivi.
+
+Inoltre, non è stata considerata questa una metrica corretta per via della
+risalita che i modelli non riescono a prevedere.
+
+# Previsioni out-of-sample
+```{r previsioni OOS}
+T_oss <- length(n_host)        # ultimo periodo osservato
+T_oos <- T_oss + 5             # orizzonte: 5 anni oltre l'ultimo dato
+
+pred_bm   <- make.instantaneous(predict(bm_host,    newx = 1:T_oos))
+pred_gbmr <- make.instantaneous(predict(GBMr1_host, newx = 1:T_oos))
+pred_gbme <- make.instantaneous(predict(GBMe1_host, newx = 1:T_oos))
+pred_ggm  <- make.instantaneous(predict(ggm_host,   newx = 1:T_oos))
+
+# Asse x con gli anni reali (osservati + futuri)
+ultimo_anno <- max(tabella_anni$anno)
+anni_oos    <- c(anni_seq, seq(ultimo_anno + 1, by = 1, length.out = 5))
+
+# ── Grafico confronto OOS ─────────────────────────────────────────────────────
+plot(anni_seq, n_host,
+     type = "b", pch = 16, lty = 3, cex = 0.7, col = 1,
+     xlim = c(min(anni_seq), max(anni_oos)),
+     ylim = c(0, max(n_host) * 1.2),
+     xlab = "Anno", ylab = "Nuovi host locali",
+     main = "Previsioni out-of-sample: confronto tra modelli")
+
+abline(v = ultimo_anno + 0.5, lty = 2, col = "grey60")  # linea di confine OOS
+
+lines(anni_oos, pred_bm,   lwd = 2, col = 2,              lty = 2)
+lines(anni_oos, pred_gbmr, lwd = 2, col = 3,              lty = 1)
+lines(anni_oos, pred_gbme, lwd = 2, col = 4,              lty = 1)
+lines(anni_oos, pred_ggm,  lwd = 2, col = pal_venezia[3], lty = 1)
+
+legend("topright",
+       legend = c("Osservati", "Bass Standard",
+                  "GBM rettangolare", "GBM esponenziale", "GGM"),
+       col    = c(1, 2, 3, 4, pal_venezia[3]),
+       lty    = c(NA, 2, 1, 1, 1),
+       pch    = c(16, NA, NA, NA, NA),
+       lwd    = c(NA, 2, 2, 2, 2),
+       bty    = "n")
+```
+
+Il grafico mette a confronto le traiettorie previste dai quattro modelli oltre
+l'ultimo anno osservato. Alcune considerazioni per la lettura:
+
+- **Bass Standard** : proietta la coda discendente della
+  curva logistica. È il punto di riferimento ma non incorpora alcuna
+  informazione sulle perturbazioni storiche.
+- **GBM rettangolare** e **GBM esponenziale**: le previsioni riflettono la
+  forma dello shock stimato; se il periodo di shock cade interamente in-sample,
+  le previsioni future convergono verso la curva logistica di fondo.
+- **GGM**: se i canali di comunicazione sono significativi, la previsione può
+  divergere dal Bass standard anche in fase di decelerazione.
+
+In generale, i modelli concordano su una **traiettoria decrescente** del numero
+di nuovi host locali nei prossimi anni, compatibile con un mercato in
+saturazione e con le restrizioni normative introdotte dal Comune di Venezia
+sugli affitti brevi. La divergenza tra le traiettorie cresce con l'orizzonte
+previsivo, sottolineando l'incertezza intrinseca delle proiezioni di lungo
+periodo.
+
+# Affinamento ARMAX
+
+L'analisi delle ACF ha mostrato autocorrelazione residua nei modelli di sola
+diffusione. Il modello ARMAX affronta questo problema mantenendo il GGM
+come **regressore esterno** per catturare il trend
+di diffusione, e delegando a una componente ARMA$(p,q)$ la struttura temporale
+rimasta nei residui. La risposta è modellata sulla serie **cumulata**
+e l'ordine ARMA viene selezionato tramite valutando l'ACF dei residui,
+il quale ha portato a scegliere una componente ARMA$(2,1)$con $d = 0$ fisso
+non si differenzia perché il trend è già catturato dal regressore di diffusione.
+
+```{r ARMAX}
+# Regressore esterno: fitted CUMULATI del modello base
+fit_base_cum <- fitted(ggm_host)     
+
+# Stima ARMAX
+armax_host <- Arima(cumsum(n_host),
+                    order = c(2, 0, 1),
+                    xreg  = fit_base_cum)
+summary(armax_host)
+# lambda ≈ 1 indica che la scala è coerente con i dati originali (buon segno)
+```
+
+## Diagnostica ARMAX
+```{r diagnostica ARMAX}
+pred_armax_inst <- make.instantaneous(fitted(armax_host))
+
+# Confronto grafico: GGM vs GGM + ARMAX vs osservati
+plot(anni_seq, n_host,
+     type = "b", pch = 16, lty = 3, cex = 0.7, col = 1,
+     xlab = "Anno", ylab = "Nuovi host locali", ylim = c(0,500),
+     main = "Affinamento ARMAX: fitted vs osservati")
+lines(anni_seq, fit_ggm_inst,    lwd = 1.5, col = 3, lty = 2)
+lines(anni_seq, pred_armax_inst, lwd = 2,   col = 2)
+legend("topright", c("Osservati", "GGM", "GGM + ARMAX"),
+       col = c(1, 3, 2), lty = c(NA, 2, 1),
+       pch = c(16, NA, NA), lwd = c(NA, 1.5, 2), bty = "n")
+
+# ACF residui: obiettivo è avvicinarsi al white noise
+acf(residuals(armax_host), main = "ACF residui – ARMAX")
+```
+
+Il confronto grafico tra GGM e GGM+ARMAX evidenzia il contributo dell'affinamento:
+la curva ARMAX aderisce più strettamente ai punti osservati, specialmente nei
+periodi in cui il GGM mostrava errori sistematici. L'ACF dei residui ARMAX
+non presenta autocorrelazioni significative, il modello ha catturato tutta la
+struttura dinamica identificabile nei dati e i residui si avvicinano al
+**white noise**; condizione necessaria per previsioni attendibili.
+
+Il $\lambda \approx 1$ dell' `Arima` indica che la scala del
+regressore esterno è coerente con quella della serie risposta, senza necessità
+di trasformazioni.
+
+## Previsioni OOS con ARMAX
+```{r previsioni OOS ARMAX}
+# Per prevedere OOS con ARMAX serve il regressore futuro.
+# Usiamo le previsioni cumulate del GGM come proxy dei periodi futuri.
+pred_ggm_cum_oos <- tail(predict(ggm_host, newx = 1:T_oos), 5)
+
+pred_armax_oos <- forecast(armax_host,
+                           h    = 5,
+                           xreg = pred_ggm_cum_oos)
+
+# Ricostruiamo la serie istantanea completa (in-sample + OOS)
+armax_cum_full  <- c(as.numeric(fitted(armax_host)),
+                     as.numeric(pred_armax_oos$mean))
+armax_inst_full <- make.instantaneous(armax_cum_full)
+
+# Intervalli di confidenza OOS (cumulate → istantanee con differenza)
+armax_lo_inst <- make.instantaneous(
+  c(as.numeric(fitted(armax_host)), as.numeric(pred_armax_oos$lower[, 2])))
+armax_hi_inst <- make.instantaneous(
+  c(as.numeric(fitted(armax_host)), as.numeric(pred_armax_oos$upper[, 2])))
+
+# ── Grafico finale: tutti i modelli + ARMAX  ───────────
+plot(anni_seq, n_host,
+     type = "b", pch = 16, lty = 3, cex = 0.7, col = 1,
+     xlim = c(min(anni_seq), max(anni_oos)),
+     ylim = c(0, max(n_host, armax_hi_inst, na.rm = TRUE) * 1.1),
+     xlab = "Anno", ylab = "Nuovi host locali",
+     main = "Previsioni OOS: tutti i modelli + affinamento ARMAX")
+
+abline(v = ultimo_anno + 0.5, lty = 2, col = "grey60")
+
+
+lines(anni_oos, pred_bm,         lwd = 1.5, col = "grey50",       lty = 2)
+lines(anni_oos, pred_gbmr,       lwd = 1.5, col = pal_venezia[5], lty = 1)
+lines(anni_oos, pred_gbme,       lwd = 1.5, col = pal_venezia[6], lty = 1)
+lines(anni_oos, pred_ggm,        lwd = 1.5, col = pal_venezia[3], lty = 1)
+lines(anni_oos, armax_inst_full, lwd = 2.5, col = pal_venezia[1], lty = 1)
+
+legend("topright",
+       legend = c("Osservati", "Bass Standard", "GBM rettangolare",
+                  "GBM esponenziale", "GGM", "GGM + ARMAX"),
+       col    = c(1, "grey50", pal_venezia[5],
+                  pal_venezia[6], pal_venezia[3], pal_venezia[1]),
+       lty    = c(NA, 2, 1, 1, 1, 1),
+       pch    = c(16, NA, NA, NA, NA, NA),
+       lwd    = c(NA, 1.5, 1.5, 1.5, 1.5, 2.5),
+       bty    = "n")
+```
+
+Il grafico finale sovrappone le previsioni di tutti e cinque i modelli,
+mostrando il miglioramento ottenuto dall'affinamento ARMAX.
+
+
+# Modello Prophet
+
+I modelli di diffusione applicati finora (Bass, GBM, GGM) sono **strutturali**:
+impongono una forma funzionale derivata da una teoria del processo di adozione.
+Prophet adotta una filosofia opposta, **data-driven**: scompone la serie in
+trend + stagionalità + punti di cambio (changepoint), senza assumere un
+meccanismo di diffusione. Questa flessibilità lo rende un utile termine di
+paragone, ma la sua interpretabilità in chiave economica è inferiore.
+
+Due adattamenti rispetto ai modelli adattati in precedenza:
+
+1. **Aggregazione mensile** invece che annuale. La serie annuale conta solo
+   17 osservazioni, insufficienti per stimare stagionalità e changepoint;
+   aggregando per mese si ottengono 197 punti.
+2. **Crescita logistica con `cap` ancorato al Bass**. Si modella la serie
+   *cumulata* degli host con `growth = "logistic"`, fissando il tetto di
+   saturazione (`cap`) pari al potenziale di mercato $m$ stimato dal modello
+   di Bass.
+
+## Preparazione dei dati
+
+```{r prophet-prep}
+# ── Serie mensile dei nuovi host locali (con mesi vuoti riempiti a 0) ─────────
+host_mensile <- host_locale_base %>%
+  mutate(mese = floor_date(data_iscrizione, "month")) %>%
+  count(mese, name = "nuovi") %>%
+  arrange(mese) %>%
+  complete(mese = seq(min(mese), max(mese), by = "month"),
+           fill = list(nuovi = 0)) %>%
+  mutate(cumulati = cumsum(nuovi))
+
+# ── Tetto di saturazione: potenziale di mercato m stimato dal Bass ───────────
+m_bass <- as.numeric(coef(bm_host)[1])
+cap_prophet <- max(m_bass, max(host_mensile$cumulati)) * 1.05  # margine 5%
+
+# ── Dataframe in formato Prophet: ds (data), y (risposta), cap (tetto) ────────
+df_prophet <- host_mensile %>%
+  transmute(ds = mese, y = cumulati, cap = cap_prophet)
+
+cat("Potenziale Bass (m):", round(m_bass),
+    "| Cap Prophet:", round(cap_prophet),
+    "| Ultimo cumulato osservato:", max(host_mensile$cumulati), "\n")
+```
+
+## Stima e previsione
+
+```{r prophet-fit, results='hide'}
+# Crescita logistica, stagionalità annuale, changepoint automatici (default 25)
+m_prophet <- prophet(df_prophet,
+                     growth = "logistic",
+                     yearly.seasonality = TRUE,
+                     weekly.seasonality = FALSE,
+                     daily.seasonality  = FALSE)
+
+# Previsione a 24 mesi (2 anni) oltre l'ultimo dato osservato
+future <- make_future_dataframe(m_prophet, periods = 24, freq = "month")
+future$cap <- cap_prophet
+forecast_prophet <- predict(m_prophet, future)
+```
+
+```{r prophet-summary}
+tail(forecast_prophet[c("ds", "yhat", "yhat_lower", "yhat_upper")])
+```
+
+## Diagnostica Prophet
+
+```{r prophet-plot-forecast}
+# Previsione cumulata con banda di incertezza e punti di cambio
+plot(m_prophet, forecast_prophet) +
+  add_changepoints_to_plot(m_prophet, threshold = 0) +
+  labs(title = "Prophet: host cumulati osservati e previsti",
+       x = "Anno", y = "Host cumulati") +
+  tema_venezia
+```
+
+```{r prophet-components}
+# Scomposizione: trend + stagionalità annuale
+prophet_plot_components(m_prophet, forecast_prophet)
+```
+
+```{r prophet-changepoints}
+# Date dei changepoint più rilevanti (variazione di pendenza non trascurabile)
+cp_rilevanti <- m_prophet$changepoints[abs(m_prophet$params$delta) > 0.01]
+cp_rilevanti
+```
+
+Il grafico della previsione mostra la curva logistica vincolata al tetto `cap`:
+le linee verticali tratteggiate segnalano i **changepoint** dove Prophet rileva
+una variazione significativa della pendenza del trend. Ci si attende un
+changepoint in corrispondenza del 2020, coincidente con il blocco pandemico,
+e un rallentamento progressivo verso la saturazione.
+
+La scomposizione separa il **trend** (la componente di diffusione di fondo)
+dalla **stagionalità annuale**, che cattura il pattern infra-annuale delle
+iscrizioni: gli host tendono ad attivare gli annunci in specifici mesi
+(tipicamente in primavera, prima della stagione turistica estiva). Questa
+informazione è invisibile ai modelli di diffusione strutturali, che operano
+su scala annuale.
+
+## Confronto con i modelli di diffusione
+
+```{r prophet-confronto-annuale}
+# Riporto Prophet su base annuale: cumulato a fine anno → differenza = nuovi host
+prophet_annuale <- forecast_prophet %>%
+  mutate(anno = year(ds)) %>%
+  group_by(anno) %>%
+  summarise(cum_fine = last(yhat), .groups = "drop") %>%
+  mutate(nuovi_prophet = cum_fine - lag(cum_fine, default = 0))
+
+# Allineo l'asse temporale con gli altri modelli (osservati + OOS)
+prophet_su_grid <- prophet_annuale %>%
+  filter(anno %in% anni_oos) %>%
+  arrange(anno)
+
+# ── Grafico: Prophet vs GGM vs osservati ─────────────────────────────────────
+plot(anni_seq, n_host,
+     type = "b", pch = 16, lty = 3, cex = 0.7, col = 1,
+     xlim = c(min(anni_seq), max(anni_oos)),
+     ylim = c(0, max(n_host, prophet_su_grid$nuovi_prophet) * 1.15),
+     xlab = "Anno", ylab = "Nuovi host locali",
+     main = "Prophet vs modelli di diffusione")
+
+abline(v = ultimo_anno + 0.5, lty = 2, col = "grey60")
+
+lines(anni_oos, pred_ggm, lwd = 2, col = pal_venezia[3], lty = 1)
+lines(prophet_su_grid$anno, prophet_su_grid$nuovi_prophet,
+      lwd = 2.5, col = pal_venezia[6], lty = 1)
+
+legend("topright",
+       legend = c("Osservati", "GGM", "Prophet"),
+       col    = c(1, pal_venezia[3], pal_venezia[6]),
+       lty    = c(NA, 1, 1),
+       pch    = c(16, NA, NA),
+       lwd    = c(NA, 2, 2.5),
+       bty    = "n")
+```
+
+Il confronto evidenzia le differenze di filosofia tra i due approcci. Il **GGM**
+produce una curva liscia, vincolata alla forma di diffusione, che estrapola in
+modo regolare oltre i dati. **Prophet** aderisce più fedelmente alle fluttuazioni
+locali grazie ai changepoint, ma la sua estrapolazione OOS dipende fortemente
+dall'ultimo regime di trend stimato e può risultare meno stabile su orizzonti
+lunghi.
+
+In sintesi: Prophet è preferibile quando l'obiettivo è la **previsione a breve
+termine** e si dispone di dati ad alta frequenza con stagionalità; i modelli
+di diffusione restano superiori per l'**interpretazione strutturale** del
+processo di adozione e per le proiezioni di lungo periodo ancorate a un
+potenziale di mercato.
+
+# Conclusioni
+
+L'analisi ha applicato una progressione di modelli di diffusione alla serie
+storica degli host locali Airbnb a Venezia, giungendo alle seguenti conclusioni:
+
+1. **Il processo di adozione ha natura prevalentemente imitativa** ($p \ll q$):
+   la crescita delle iscrizioni è stata guidata dall'effetto rete tra host già
+   attivi, non da campagne di acquisizione esterne. Il picco si è collocato
+   intorno al 2016–2017.
+
+2. **Il Bass standard è un punto di partenza valido** ma soffre di una
+   sottostima sistematica nella fase di lancio e non cattura le discontinuità
+   indotte da shock esogeni (COVID-19, normative).
+
+3. **I modelli GBM migliorano il fit in presenza di perturbazioni**: lo shock
+   rettangolare è più interpretabile, quello esponenziale più flessibile ma con
+   stime meno stabili. La scelta tra i due dipende dalla significatività dei
+   parametri dello shock e dalla qualità dell'ACF residua.
+
+4. **Il GGM è il candidato naturale per correggere il fit iniziale** senza
+   introdurre artificialmente uno shock: i parametri di comunicazione $p_c$ e
+   $q_c$ amplificano la curva logistica in modo endogeno.
+
+5. **L'affinamento ARMAX riduce l'autocorrelazione residua** e produce
+   previsioni più aderenti a breve orizzonte. Le previsioni OOS indicano una
+   traiettoria decrescente del numero di nuovi host locali nei prossimi anni,
+   coerente con un mercato in maturazione e con il quadro normativo
+   crescentemente restrittivo sugli affitti brevi a Venezia.
+
+6. **Prophet offre un controllo data-driven** complementare: ancorando la
+   crescita logistica al potenziale $m$ del Bass e sfruttando la frequenza
+   mensile, individua i changepoint (in primis quello pandemico) e una
+   stagionalità infra-annuale invisibile ai modelli strutturali. Resta però
+   uno strumento descrittivo-previsivo, non esplicativo: la lettura economica
+   del fenomeno rimane affidata ai modelli di diffusione.

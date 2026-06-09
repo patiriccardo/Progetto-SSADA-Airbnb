@@ -1,0 +1,1403 @@
+---
+title: "Analisi descrittive — Affitti brevi a Venezia"
+subtitle: "Strumenti statistici per dati aziendali"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    theme: flatly
+    highlight: tango
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,       # visibile ma collassabile (code_folding: hide)
+  message = FALSE,
+  warning = FALSE,
+  fig.width  = 9,
+  fig.height = 5.2,     # rapporto 16:9 per le slide
+  dpi = 150
+)
+```
+
+---
+
+# 0. Setup
+
+```{r librerie}
+library(tidyverse)
+library(arrow)
+library(scales)
+library(lubridate)
+library(kableExtra)
+# library(sf)   # solo per la coropleta opzionale in fondo
+```
+
+```{r tema}
+# ── Palette e tema condivisi ──────────────────────────────────────────────────
+pal_venezia <- c("#0B3C5D", "#328CC1", "#D9B310", "#1D2731", "#8C9A9E", "#C04A3B")
+
+tema_venezia <- theme_minimal(base_size = 13) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 15),
+    plot.subtitle    = element_text(color = "grey30"),
+    plot.caption     = element_text(color = "grey45", size = 9, hjust = 0),
+    panel.grid.minor = element_blank(),
+    legend.position  = "top"
+  )
+theme_set(tema_venezia)
+
+# Didascalie fonte standardizzate
+cap_inside <- "Fonte: Inside Airbnb — 5 811 annunci, prezzo al 15/09/2025"
+cap_airroi <- "Fonte: AirROI — 250 annunci, dati 05/2025–04/2026"
+
+# Helper: salva PNG slide-ready in analisi/grafici/ cosi trovo tutto in quella cartella
+dir.create("grafici", showWarnings = FALSE)
+salva <- function(nome, p = last_plot(), w = 9, h = 5.2)
+  ggsave(file.path("grafici", paste0(nome, ".png")),
+         p, width = w, height = h, dpi = 300, bg = "transparent")
+```
+
+```{r carico-dati}
+load("../dati/airbnb_pulito.Rdata")           # Inside Airbnb (5 811 × ~51)
+load("../dati/airroi_pulito.Rdata")           # AirROI pulito  (250  × ~17)
+mensili <- read_parquet("../dati/Past_calander_rates.parquet")
+
+mensili <- mensili %>%
+  mutate(date = as.Date(date),
+         mese = floor_date(date, "month")) %>%
+  filter(listing_id %in% airroi_pulito$listing_id) %>%   # ← stesso filtro di airroi_pulito
+  left_join(airroi_pulito %>% select(listing_id, room_type), by = "listing_id")
+```
+
+> **Nota sulle fonti.** *Inside Airbnb* è una fotografia statica su ~5 800 annunci: utile per struttura e posizione. *AirROI* copre 250 annunci su 12 mesi: utile per stagionalità, occupazione e ricavi. Usiamo ciascuna per ciò che sa fare meglio.
+
+---
+```{r}
+load("../dati/airbnb_pulito.Rdata")
+
+tab_variabili_pro <- function(dati) {
+  tab <- data.frame(
+    "Nome_variabile" = names(dati),
+    "Class" = sapply(dati, function(x) paste(class(x), collapse = ", ")),
+    "Modalita" = sapply(dati, function(x) length(unique(x))),
+    "NAs" = sapply(dati, function(x) sum(is.na(x))),
+    stringsAsFactors = FALSE
+  )
+  
+  # Rimuove i nomi delle righe per una visualizzazione più pulita
+  rownames(tab) <- NULL 
+  return(tab)
+}
+
+#### Imputazione valori mancanti
+
+# Raggruppa i quartieri con meno di 50 osservazioni in "Isole Minori"
+airbnb_pulito <- airbnb_pulito %>%
+  mutate(neighbourhood_cleansed = fct_lump_min(
+    neighbourhood_cleansed, 
+    min = 50, 
+    other_level = "Isole Minori"
+  ))
+
+# Controlla il nuovo risultato
+table(airbnb_pulito$neighbourhood_cleansed)
+
+airbnb_pulito <- airbnb_pulito %>%
+  mutate(
+    # 1. Creiamo la dummy (1 se ha recensioni, 0 se non le ha)
+    has_reviews = ifelse(number_of_reviews > 0, 1, 0)
+  ) %>%
+  mutate(
+    # 2. Sostituiamo gli NA con 0
+    # Nei modelli lineari e GAM le review scores entrano SOLO come interazione
+    # con has_reviews (has_reviews:review_scores_*), quindi il valore imputato
+    # è irrilevante per chi non ha recensioni: has_reviews=0 azzera il termine.
+    across(
+      c(starts_with("review_scores"), reviews_per_month),
+      ~coalesce(., 0)
+    )
+  )
+
+# Imputazione manule per i 5 host che non hanno la data dell'apetura dell'account
+which(is.na(airbnb_pulito$host_since))
+
+airbnb_pulito[c(3088,4404,4418,4419,4421),]
+# Sono riferiti tutti allo stesso host il signor Michele
+# In airbnb c'è scritto che è host da 5 anni
+
+# Riconverti i numeri in date usando l'origine standard di R
+airbnb_pulito$host_since <- as.Date(airbnb_pulito$host_since,
+                                    origin = "1970-01-01")
+
+airbnb_pulito <- airbnb_pulito %>%
+  mutate(
+    # Creiamo una nuova colonna numerica contenente solo l'anno
+    host_since = year(host_since)
+  )
+
+# Controlla il risultato
+head(airbnb_pulito$host_since)
+
+# Imputazione ai dati mancanti
+airbnb_pulito$host_since[c(3088,4404,4418,4419,4421)] = 2021
+
+# controllo
+which(is.na(airbnb_pulito$host_since))
+
+# Dalla pagine dell'host vedo Risponde entro un giorno
+# Metto 
+airbnb_pulito$host_response_time[c(3088,4404,4418,4419,4421)] = "within a day"
+
+# Controlliamo il risultato per essere sicuri che tutto torni
+table(airbnb_pulito$host_response_time, useNA = "always")
+
+# Dalla pagine dell'host vedo anche che è verificato
+# Metto TRUE
+airbnb_pulito$host_identity_verified[c(3088,4404,4418,4419,4421)] = TRUE
+
+table(airbnb_pulito$host_identity_verified, useNA = "always")
+
+# Dalla pagina dell'host vedo anche che ha 5 annunci
+# Metto TRUE
+airbnb_pulito$host_type_classe[c(3088,4404,4418,4419,4421)] = "5-19 alloggi (Medio host)"
+
+table(airbnb_pulito$host_identity_verified, useNA = "always")
+
+# tab_variabili_pro(airbnb_pulito)
+
+which(is.na(airbnb_pulito$bathrooms))
+# 194 --> ha un bagno
+# 4554 --> Non più online (tolto osservazione)
+# 5604 --> Annuncio riferito a 3 camere 2 con un bagno e una senza (metto 1 bagno)
+airbnb_pulito$bathrooms[194] = 1
+airbnb_pulito$bathrooms[5604] = 1
+
+# tab_variabili_pro(airbnb_pulito)
+
+# Non più online tolgo l'osservazione
+which(is.na(airbnb_pulito$beds))
+
+airbnb_pulito = airbnb_pulito[-c(4554,5099),]
+
+# tab_variabili_pro(airbnb_pulito)
+
+airbnb_pulito <- airbnb_pulito %>%
+  mutate(
+    # fct_recode funziona con la logica: "Nuovo Nome" = "Vecchio Nome"
+    host_type_classe = fct_recode(
+      host_type_classe,
+      "1 annuncio (Privato)"           = "1 alloggio (Privato)",
+      "2-4 annunci (Piccolo host)"     = "2-4 alloggi (Piccolo host)",
+      "5-19 annunci (Medio host)"      = "5-19 alloggi (Medio host)",
+      "20-99 annunci (Professionista)" = "20-99 alloggi (Professionista)",
+      "100+ annunci (Grande Agenzia)"  = "100+ alloggi (Grande Agenzia)"
+    )
+  )
+
+# Controllando gli annunci concorrenti per Hotel Lido ho visto che è una stanza con letto singolo non 2
+airbnb_pulito$accommodates[which(airbnb_pulito$listing_url == "https://www.airbnb.com/rooms/36330119")] = 1
+
+# saveRDS(airbnb_pulito,file("../dati/airbnb_pulito2.RData"))
+
+# Calcolo l'anzianità dell'host in giorni (rispetto alla data in cui stai facendo l'analisi)
+data_riferimento <- as.Date("2025-09-15")
+
+dati_modelli <- airbnb_pulito %>%
+  mutate(
+    # Trasformo la data in un numero (Anzianità in giorni)
+    host_since = as.Date(host_since),
+    giorni_da_host = as.numeric(difftime(data_riferimento, host_since, units = "days"))
+  ) %>%
+  select(
+    # ID e Target
+    listing_id = id, 
+    y = price_num,
+    
+    # 1. Caratteristiche Fisiche
+    room_type, accommodates, bedrooms, beds, bathrooms_clean,
+    
+    # 2. Geografia 
+    # (Da smistare: Coordinate per gli alberi, Neighbourhood per i lineari)
+    neighbourhood_cleansed, latitude, longitude,
+    
+    # 3. Profilo e Gestione Host
+    host_is_superhost, giorni_da_host, host_is_local, instant_bookable,
+    calculated_host_listings_count, host_type_classe, 
+    host_acceptance_classe, host_response_classe,
+    
+    # 4. Regole di Booking e Disponibilità
+    minimum_nights_avg_ntm, availability_30, availability_365,
+    has_reviews, number_of_reviews_ltm, reviews_per_month,
+    review_scores_rating, review_scores_accuracy, review_scores_cleanliness,
+    review_scores_checkin, review_scores_communication, 
+    review_scores_location, review_scores_value
+  ) %>%
+  rename(neighbourhood = neighbourhood_cleansed) %>%
+  filter(!is.na(y))
+
+cat("Variabili selezionate:", ncol(dati_modelli), "\n")
+```
+
+
+# 1. Dimensione e struttura del mercato {#sec-mercato}
+
+> **Tecnica collegata:** modello di diffusione (Bass) sulla curva di ingresso degli host.
+
+```{r offerta-per-sestiere}
+P_ORA  <- "#F36F21"   # arancione — accento principale / Il Canaletto
+
+p1a <- airbnb_pulito %>%
+  count(neighbourhood_cleansed, sort = TRUE) %>%
+  mutate(neighbourhood_cleansed = fct_reorder(neighbourhood_cleansed, n)) %>%
+  # Creiamo due colonne per gestire dinamicamente l'evidenziazione del Lido
+  mutate(col_segmento = if_else(neighbourhood_cleansed == "Lido", P_ORA, "grey70"),
+         col_punto    = if_else(neighbourhood_cleansed == "Lido", P_ORA, pal_venezia[1])) %>%
+  ggplot(aes(n, neighbourhood_cleansed)) +
+  # Usiamo i colori dinamici mappati nelle nuove colonne. Linewidth aumentata per proporzione.
+  geom_segment(aes(xend = 0, yend = neighbourhood_cleansed, color = col_segmento),
+               linewidth = 0.8) +
+  geom_point(aes(size = n, color = col_punto), alpha = 0.85) +
+  # Testo ingrandito (size 4.5) e messo in grassetto
+  geom_text(aes(label = n), hjust = -0.5, size = 4.5, color = "white", fontface = "bold") +
+  scale_color_identity() +
+  # Espansione destra aumentata a 0.18 per dare spazio ai numeri ingranditi
+  scale_x_continuous(expand = expansion(mult = c(0, 0.18))) +
+  # Range dei punti leggermente ingrandito per bilanciare i testi
+  scale_size_continuous(range = c(3, 10), guide = "none") +
+  labs(title = "Distribuzione dell'offerta per sestiere / isola",
+       subtitle = "Numero di annunci attivi (Inside Airbnb, set. 2025)",
+       x = NULL, y = NULL, caption = cap_inside) +
+  theme(
+    # Dimensioni esplicite e ingrandite per tutti gli elementi testuali
+    axis.text.y = element_text(color = "white", size = 22, face = "bold"),
+    axis.text.x = element_text(color = "white", size = 17),
+    axis.title = element_text(color = "white", size = 17),
+    plot.title = element_text(color = "white", face = "bold", size = 25),
+    plot.subtitle = element_text(color = "white", size = 19, margin = margin(b = 10)),
+    plot.caption = element_text(color = "white", size = 15),
+    
+    # Sfondi totalmente trasparenti
+    plot.background = element_rect(fill = "transparent", color = NA),
+    panel.background = element_rect(fill = "transparent", color = NA),
+    
+    # Griglia di base adattata per il contrasto
+    panel.grid.major.x = element_line(color = "grey30", linewidth = 0.3),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+
+p1a
+ggsave("grafici_trasparenti/01a_offerta_per_sestiere.png", plot = p1a, width = 10, height = 6, bg = "transparent", dpi = 300)
+```
+
+```{r quota-room-type}
+# >>> SLIDE 1-B ─ Composizione per tipologia
+p1b <- airbnb_pulito %>%
+  count(room_type) %>%
+  mutate(quota = n / sum(n),
+         room_type = fct_reorder(room_type, quota)) %>%
+  ggplot(aes(quota, room_type, fill = room_type)) +
+  geom_col(show.legend = FALSE, width = 0.65) +
+  geom_text(aes(label = paste0(percent(quota, accuracy = 1), "  (n = ", n, ")")),
+            hjust = -0.05, size = 3.3) +
+  scale_x_continuous(labels = percent_format(),
+                     expand = expansion(mult = c(0, 0.25))) +
+  scale_fill_manual(values = pal_venezia[c(1, 2, 4, 6)]) +
+  labs(title = "Composizione del mercato per tipologia di alloggio",
+       x = "Quota annunci", y = NULL, caption = cap_inside)
+p1b
+salva("01b_quota_room_type", p1b)
+```
+
+```{r curva-ingresso-host}
+# >>> SLIDE 1-C ─ Curva di ingresso cumulata → aggancio Bass
+p1c <- airbnb_pulito %>%
+  mutate(data_iscrizione = as.Date(host_since, origin = "1970-01-01")) %>%
+  filter(!is.na(data_iscrizione)) %>%
+  count(data_iscrizione) %>% # 1. Conta quanti host si sono iscritti ogni giorno
+  arrange(data_iscrizione) %>%
+  mutate(host_cumulati = cumsum(n)) %>% # 2. Calcola la vera somma cumulativa
+  ggplot(aes(data_iscrizione, host_cumulati)) +
+  geom_area(fill = pal_venezia[2], alpha = 0.18) +
+  geom_line(color = pal_venezia[1], linewidth = 1.1) +
+  scale_y_continuous(limits = c(0, 10000), labels = comma_format()) +
+  labs(title = "Crescita cumulata degli host nel tempo",
+       subtitle = "La forma a S è il segnale di un processo di diffusione (→ modello Bass)",
+       x = NULL, y = "Host cumulati", caption = cap_inside)
+
+p1c
+salva("01c_ingresso_host", p1c)
+```
+
+> **💡 Messaggio chiave:** il mercato veneziano conta quasi 5 800 annunci concentrati in pochi sestieri storici. La curva di crescita degli host mostra la tipica forma a S di un processo di adozione: il mercato è vicino alla saturazione. Il modello di Bass quantificherà questa intuizione e risponderà alla domanda *«conviene ancora entrare?»*.
+
+-Fare curva non aggregata
+-filtrare per chi ha residenza in veneto
+
+
+---
+
+# 2. Prezzi e posizione {#sec-prezzi}
+
+> **Tecnica collegata:** modello gerarchico (zona / tipologia) e k-NN spaziale per il pricing comparativo.
+
+```{r distribuzione-prezzi}
+# >>> SLIDE 2-A ─ Distribuzione dei prezzi 
+p2a <- airbnb_pulito %>%
+  filter(!is.na(price_num), price_num > 0) %>%
+  ggplot(aes(price_num)) +
+  # Barre grigie con contorno bianco
+  geom_histogram(bins = 55, fill = "grey70", color = "white", alpha = 0.9) +
+  # Ritorno alla scala normale lineare (niente log10)
+  scale_x_continuous(labels = dollar_format()) +
+  # Etichette aggiornate (rimosso il riferimento al logaritmo)
+  labs(title = "Distribuzione dei prezzi a notte",
+       subtitle = "Forte asimmetria a destra, mediana= $173",
+       x = "Prezzo a notte ($)", y = "N. annunci", caption = cap_inside) +
+  theme(
+    # Testi bianchi e ingranditi significativamente
+    axis.text = element_text(color = "white", size = 14),
+    axis.title = element_text(color = "white", size = 15, face = "bold"),
+    plot.title = element_text(color = "white", face = "bold", size = 20),
+    plot.subtitle = element_text(color = "white", size = 16, margin = margin(b = 10)),
+    plot.caption = element_text(color = "white", size = 12),
+    
+    # Sfondi totalmente trasparenti per le slide scure
+    plot.background = element_rect(fill = "transparent", color = NA),
+    panel.background = element_rect(fill = "transparent", color = NA),
+    panel.grid = element_blank()
+    
+  )
+
+p2a
+ggsave("grafici_trasparenti/02a_distribuzione_prezzi.png", plot = p2a, width = 10, height = 6, bg = "transparent", dpi = 300)
+```
+
+```{r prezzo-per-sestiere}
+# >>> SLIDE 2-B ─ Il peso della location
+p2b <- airbnb_pulito %>%
+  filter(!is.na(price_num), price_num > 0) %>%
+  group_by(neighbourhood_cleansed) %>%
+  summarise(mediana = median(price_num), n = n(), .groups = "drop") %>%
+  filter(n >= 20) %>%
+  mutate(neighbourhood_cleansed = fct_reorder(neighbourhood_cleansed, mediana)) %>%
+  # Creazione della colonna per il colore dinamico: Lido arancione, resto grigio
+  mutate(col_barra = if_else(neighbourhood_cleansed == "Lido", P_ORA, "grey70")) %>%
+  ggplot(aes(mediana, neighbourhood_cleansed)) +
+  geom_col(aes(fill = col_barra), width = 0.7, show.legend = FALSE) +
+  # Dimensione etichette proporzionata ai nuovi assi (size = 7.5)
+  geom_text(aes(label = dollar(mediana, accuracy = 1)),
+            hjust = -0.2, size = 7.5, color = "white", fontface = "bold") +
+  scale_fill_identity() +
+  # Maggior margine destro per ospitare i numeri ingranditi
+  scale_x_continuous(labels = dollar_format(),
+                     expand = expansion(mult = c(0, 0.22))) +
+  labs(title = "Prezzo mediano per sestiere / isola",
+       subtitle = "Solo zone con ≥ 20 annunci",
+       x = "Prezzo mediano a notte ($)", y = NULL, caption = cap_inside) +
+  theme(
+    # Le tue nuove grandezze esplicite
+    axis.text.y = element_text(color = "white", size = 22, face = "bold"),
+    axis.text.x = element_text(color = "white", size = 17),
+    axis.title = element_text(color = "white", size = 17),
+    plot.title = element_text(color = "white", face = "bold", size = 25),
+    plot.subtitle = element_text(color = "white", size = 19, margin = margin(b = 10)),
+    plot.caption = element_text(color = "white", size = 15),
+    
+    # Sfondi totalmente trasparenti
+    plot.background = element_rect(fill = "transparent", color = NA),
+    panel.background = element_rect(fill = "transparent", color = NA),
+    
+    # Rimozione totale della griglia (migliore per grafici con etichette dirette)
+    panel.grid = element_blank()
+  )
+
+p2b
+ggsave("grafici_trasparenti/02b_prezzo_mediano_sestiere.png", plot = p2b, width = 10, height = 6, bg = "transparent", dpi = 300)
+```
+
+```{r prezzo-per-tipologia}
+library(forcats)
+library(scales)
+library(ggplot2)
+
+p2c <- airbnb_pulito %>%
+  filter(!is.na(price_num), price_num > 0,
+         room_type != "Shared room") %>%
+  mutate(room_type = fct_collapse(room_type,
+           "Entire home/apt" = c("Entire home/apt", "Hotel room"))) %>%
+  mutate(room_type = fct_drop(room_type)) %>%
+  add_count(room_type, name = "freq") %>%
+  # Creazione dell'etichetta con la frequenza e riordino basato sulla mediana del prezzo
+  mutate(etichetta = paste0(room_type, "\n(n = ", freq, ")"),
+         etichetta = fct_reorder(etichetta, price_num, median)) %>%
+  # Sostituito 'room_type' con 'etichetta' sull'asse Y
+  ggplot(aes(x = price_num, y = etichetta, fill = room_type)) +
+  geom_boxplot(color = "white", outlier.color = "white", 
+               show.legend = FALSE, outlier.alpha = 0.2, width = 0.55) +
+  scale_x_continuous(labels = dollar_format()) +          
+  scale_fill_manual(values = c("#E8852B", "#2E8B57")) +   
+  labs(title = "Distribuzione del prezzo per tipologia di alloggio",
+       x = "Prezzo a notte ($)", y = NULL, caption = cap_inside) +
+  theme(
+    axis.text.y = element_text(color = "white", size = 22, face = "bold"),
+    axis.text.x = element_text(color = "white", size = 17),
+    axis.title = element_text(color = "white", size = 17),
+    plot.title = element_text(color = "white", face = "bold", size = 25),
+    plot.subtitle = element_text(color = "white", size = 19, margin = margin(b = 10)),
+    plot.caption = element_text(color = "white", size = 15),
+    
+    plot.background = element_rect(fill = "transparent", color = NA),
+    panel.background = element_rect(fill = "transparent", color = NA),
+    
+    panel.grid = element_blank()
+  )
+
+p2c
+
+ggsave("grafici_trasparenti/02c_prezzo_per_tipologia.png", plot = p2c, width = 11, height = 6.5, bg = "transparent", dpi = 300)
+
+```
+
+```{r}
+#PREZZI PER TIPO DI STANZA PER QUARTIERE LIDO CON FREQUENZA
+# >>> SLIDE — Prezzo per tipo di stanza, Lido
+P_VER  <- "#006241"   # verde     — accento secondario / Lido Sands
+
+p_lido_tipo <- airbnb_pulito %>%
+  filter(neighbourhood_cleansed == "Lido",
+         !is.na(price_num), price_num > 0,
+         room_type != "Shared room") %>%
+  mutate(room_type = fct_collapse(room_type,
+           "Entire home/apt" = c("Entire home/apt", "Hotel room"))) %>%
+  mutate(room_type = fct_drop(room_type)) %>%
+  add_count(room_type, name = "freq") %>%
+  mutate(etichetta = paste0(room_type, "\n(n = ", freq, ")"),
+         etichetta = fct_reorder(etichetta, price_num, median)) %>%
+  ggplot(aes(price_num, etichetta, fill = room_type)) +
+  # Bordi e outlier bianchi per contrastare lo sfondo scuro
+  geom_boxplot(color = "white", outlier.color = "white",
+               show.legend = FALSE, outlier.alpha = 0.2, width = 0.55) +
+  scale_x_continuous(labels = dollar_format()) +
+  scale_fill_manual(values = c("Entire home/apt" = P_VER, "Private room" = P_ORA)) +
+  labs(title   = "Prezzo per tipologia di stanza — Lido",
+       x = "Prezzo a notte ($)", y = NULL, caption = cap_inside) +
+  theme(
+    # Grandezze esplicite standardizzate
+    axis.text.y = element_text(color = "white", size = 22, face = "bold"),
+    axis.text.x = element_text(color = "white", size = 17),
+    axis.title = element_text(color = "white", size = 17),
+    plot.title = element_text(color = "white", face = "bold", size = 25),
+    plot.subtitle = element_text(color = "white", size = 19, margin = margin(b = 10)),
+    plot.caption = element_text(color = "white", size = 15),
+    
+    # Sfondi totalmente trasparenti
+    plot.background = element_rect(fill = "transparent", color = NA),
+    panel.background = element_rect(fill = "transparent", color = NA),
+    
+    # Rimozione totale della griglia, come richiesto
+    panel.grid = element_blank()
+  )
+
+p_lido_tipo
+ggsave("grafici_trasparenti/02c_lido_prezzo_room_type.png", plot = p_lido_tipo, width = 11, height = 6.5, bg = "transparent", dpi = 300)
+```
+
+```{r}
+#PREZZI PER TIPO DI STANZA PER QUARTIERE CANNAREGGIO CON FREQUENZA
+# >>> SLIDE — Prezzo per tipo di stanza, Cannaregio
+
+p_can_tipo <- airbnb_pulito %>%
+  filter(neighbourhood_cleansed == "Cannaregio",
+         !is.na(price_num), price_num > 0,
+         room_type != "Shared room") %>%
+  mutate(room_type = fct_collapse(room_type,
+           "Entire home/apt" = c("Entire home/apt", "Hotel room"))) %>%
+  mutate(room_type = fct_drop(room_type)) %>%
+  add_count(room_type, name = "freq") %>%
+  mutate(etichetta = paste0(room_type, "\n(n = ", freq, ")"),
+         etichetta = fct_reorder(etichetta, price_num, median)) %>%
+  ggplot(aes(price_num, etichetta, fill = room_type)) +
+  geom_boxplot(show.legend = FALSE, outlier.alpha = 0.15, width = 0.55) +
+  scale_x_continuous(labels = dollar_format()) +
+  scale_fill_manual(values = c("Entire home/apt" = P_ORA, "Private room" = P_VER)) +
+  labs(title   = "Prezzo per tipologia di stanza — Cannaregio",
+       x = "Prezzo a notte ($)", y = NULL, caption = cap_inside) +
+  theme(
+    axis.text = element_text(color = "white"),
+    axis.title = element_text(color = "white"),
+    plot.title = element_text(color = "white", face = "bold"),
+    plot.caption = element_text(color = "white"),
+    plot.background = element_rect(fill = "transparent", color = NA),
+    panel.background = element_rect(fill = "transparent", color = NA),
+    panel.grid.major = element_blank()
+  )
+
+p_can_tipo
+ggsave("02c_cannaregio_prezzo_room_type.png", plot = p_can_tipo, width = 10, height = 6, bg = "transparent", dpi = 300)
+```
+
+```{r}
+# >>> EXTRA — Composizione offerta per tipologia e sestiere
+
+# Preparo i dati e l'ordine delle zone
+dati_quota <- airbnb_pulito %>%
+  filter(!is.na(neighbourhood_cleansed), room_type != "Shared room") %>%
+  mutate(room_type = fct_collapse(room_type,
+           "Entire home/apt" = c("Entire home/apt", "Hotel room")),
+         room_type = fct_drop(room_type)) %>%
+  group_by(neighbourhood_cleansed, room_type) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(neighbourhood_cleansed) %>%
+  mutate(quota = n / sum(n), tot = sum(n)) %>%
+  ungroup() %>%
+  filter(tot >= 20)
+
+# Ordino le zone per quota crescente di Entire home/apt
+ordine_zone <- dati_quota %>%
+  filter(room_type == "Entire home/apt") %>%
+  arrange(quota) %>%
+  pull(neighbourhood_cleansed)
+
+# Colori etichette asse x: verde Lido, arancione Cannaregio, grigio resto
+col_etichette <- case_when(
+  ordine_zone == "Lido"       ~ P_VER,
+  ordine_zone == "Cannaregio" ~ P_ORA,
+  TRUE                        ~ "grey35"
+)
+
+p_quota_zona <- dati_quota %>%
+  mutate(neighbourhood_cleansed = factor(neighbourhood_cleansed, levels = ordine_zone)) %>%
+  ggplot(aes(neighbourhood_cleansed, quota, fill = room_type)) +
+  geom_col(position = "fill", width = 0.72) +
+  geom_text(aes(label = percent(quota, accuracy = 1)),
+            position = position_fill(vjust = 0.5),
+            size = 2.9, color = "white", fontface = "bold") +
+  scale_fill_manual(values = c("Entire home/apt" = P_NAV, "Private room" = P_GRI)) +
+  scale_y_continuous(labels = percent_format()) +
+  theme(axis.text.x = element_text(angle = 35, hjust = 1,
+                                   color = col_etichette, face = "bold")) +
+  labs(title    = "Composizione dell'offerta per tipologia e sestiere",
+       subtitle  = "Lido e Cannaregio evidenziati — zone ordinate per quota crescente di appartamenti interi",
+       x = NULL, y = "Quota", fill = NULL, caption = cap_inside)
+p_quota_zona
+```
+
+
+```{r confronto-listino-realizzato}
+# >>> Extra ─ Listino (Inside) vs tariffa media realizzata (AirROI)
+
+# Merge: solo gli annunci presenti in entrambe le fonti
+confronto <- airbnb_pulito %>%
+  select(id, price_num) %>%
+  inner_join(select(airroi_pulito, listing_id, ttm_avg_rate),
+             by = c("id" = "listing_id"))
+
+nrow(confronto)   # controllo: dovrebbe essere ~250 (gli annunci appaiati)
+
+p2d <- bind_rows(
+  tibble(prezzo = confronto$price_num,    fonte = "Inside Airbnb — listino 15/09"),
+  tibble(prezzo = confronto$ttm_avg_rate, fonte = "AirROI — tariffa media 12 mesi")
+) %>%
+  filter(!is.na(prezzo), prezzo > 0) %>%
+  ggplot(aes(prezzo, fill = fonte, color = fonte)) +
+  geom_density(alpha = 0.22, linewidth = 0.9) +
+  scale_x_log10(labels = dollar_format()) +
+  scale_fill_manual(values  = c("#2E8B57", "#E8852B")) +   # verde, arancione
+  scale_color_manual(values = c("#2E8B57", "#E8852B")) +
+  labs(title = "Prezzo di listino vs tariffa media realizzata",
+       subtitle = "Stessi annunci (presenti in entrambe le fonti): tariffa annua vs listino di settembre",
+       x = "Prezzo a notte (scala log, $)", y = "Densità",
+       fill = NULL, color = NULL,
+       caption = "Inside Airbnb 15/09/2025 · AirROI 05/2025–04/2026")
+p2d
+salva("02d_listino_vs_realizzato", p2d)
+```
+
+Differenza di prezzo tra gli annunci di un dataset e dell'altro (prezzo al 15/09 e medio annuale)
+```{r}
+#summary(dataset1-dataset 2) con il merge 
+confronto <- confronto %>%
+  filter(!is.na(price_num), !is.na(ttm_avg_rate)) %>%
+  mutate(differenza = ttm_avg_rate - price_num)   # tariffa media AirROI - listino Inside 
+
+summary(confronto$differenza)
+
+ggplot(confronto, aes(differenza)) +
+  geom_histogram(bins = 40, fill = pal_venezia[2], color = "white") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey30") +
+  scale_x_continuous(labels = dollar_format()) +
+  labs(title = "Scarto tra tariffa media annua e listino di settembre",
+       subtitle = "Per gli stessi annunci presenti in entrambe le fonti",
+       x = "Differenza prezzo a notte ($)", y = "N. annunci", caption = cap_inside)
+```
+
+```{r}
+# >>> Extra ─ Listino (Inside) vs tariffa settembre realizzata (AirROI)
+
+library(arrow)
+
+# Carica i dati mensili AirROI e filtra settembre 2025
+past_rates <- read_parquet("../dati/Past_calander_rates.parquet")
+
+airroi_settembre <- past_rates %>%
+  filter(format(date, "%Y-%m") == "2025-09") %>%   # ← settembre 2025
+  group_by(listing_id) %>%
+  summarise(rate_settembre = mean(rate_avg, na.rm = TRUE), .groups = "drop")
+
+# Merge triplo: Inside ∩ AirROI ∩ settembre
+confronto <- airbnb_pulito %>%
+  select(id, price_num) %>%
+  inner_join(select(airroi_pulito, listing_id), by = c("id" = "listing_id")) %>%
+  inner_join(airroi_settembre, by = c("id" = "listing_id"))
+
+nrow(confronto)  # quanti annunci hanno tutti e tre i dati
+
+p2d <- bind_rows(
+  tibble(prezzo = confronto$price_num,       fonte = "Inside Airbnb — listino 15/09"),
+  tibble(prezzo = confronto$rate_settembre,  fonte = "AirROI — tariffa media settembre 2025")
+) %>%
+  filter(!is.na(prezzo), prezzo > 0) %>%
+  ggplot(aes(prezzo, fill = fonte, color = fonte)) +
+  geom_density(alpha = 0.22, linewidth = 0.9) +
+  scale_x_log10(labels = dollar_format()) +
+  scale_fill_manual(values  = c("#2E8B57", "#E8852B")) +
+  scale_color_manual(values = c("#2E8B57", "#E8852B")) +
+  labs(
+    title    = "Prezzo di listino vs tariffa realizzata — stesso mese",
+    subtitle = "Stessi annunci: listino Inside Airbnb 15/09 vs tariffa media AirROI settembre 2025",
+    x = "Prezzo a notte (scala log, $)", y = "Densità",
+    fill = NULL, color = NULL,
+    caption = "Inside Airbnb 15/09/2025 · AirROI settembre 2025"
+  )
+p2d
+```
+
+
+> **💡 Messaggio chiave:** la posizione spiega una parte enorme del prezzo (forbice ~3× tra sestieri). Il prezzo di listino fissato a settembre sovrastima la tariffa media annua: un host nuovo che si posiziona solo sul listino di picco si espone al rischio di bassa occupazione fuori stagione.
+
+
+---
+
+# 3. Host e professionalizzazione del mercato {#sec-host}
+
+> **Tecnica collegata:** segmentazione e regole associative per identificare il profilo di host da imitare.
+
+```{r profilo-host}
+# >>> SLIDE 3-A ─ Multi-property vs privati
+# Calcolo il numero di categorie per generare la palette su misura
+n_classi <- length(unique(airbnb_pulito$host_type_classe[!is.na(airbnb_pulito$host_type_classe)]))
+
+# Genero il gradiente dal verde all'arancione
+palette_host <- colorRampPalette(c(P_VER, P_ORA))(n_classi)
+
+# >>> SLIDE 3-A ─ Multi-property vs privati
+p3a <- airbnb_pulito %>%
+  filter(!is.na(host_type_classe)) %>%
+  count(host_type_classe) %>%
+  mutate(quota = n / sum(n)) %>%
+  ggplot(aes(x = host_type_classe, y = quota, fill = host_type_classe)) +
+  geom_col(show.legend = FALSE, width = 0.7) +
+  # Testi giganti proporzionati ai nuovi assi e colorati in bianco
+  geom_text(aes(label = paste0(percent(quota, accuracy = 1), "\n(n=", n, ")")),
+            vjust = -0.2, size = 7.5, lineheight = 0.9, color = "white", fontface = "bold") +
+  # Aumentata leggermente l'espansione Y per evitare tagli sul testo a due righe
+  scale_y_continuous(labels = percent_format(),
+                     expand = expansion(mult = c(0, 0.22))) +
+  scale_fill_manual(values = palette_host) +
+  labs(title = "Profilo degli host per numero di alloggi gestiti",
+       subtitle = "Quanta parte del mercato è in mano a operatori professionali?",
+       x = NULL, y = "Quota", caption = cap_inside) +
+  theme(
+    # Grandezze standard per le slide scure
+    axis.text.y = element_text(color = "white", size = 22, face = "bold"),
+    # Asse X: mantenuto l'angolo a 18 (o 20) ma ingrandito il font
+    axis.text.x = element_text(color = "white", size = 17, angle = 20, hjust = 1),
+    axis.title = element_text(color = "white", size = 17),
+    plot.title = element_text(color = "white", face = "bold", size = 25),
+    plot.subtitle = element_text(color = "white", size = 19, margin = margin(b = 10)),
+    plot.caption = element_text(color = "white", size = 15),
+    
+    # Sfondi trasparenti
+    plot.background = element_rect(fill = "transparent", color = NA),
+    panel.background = element_rect(fill = "transparent", color = NA),
+    
+    # Rimozione totale griglia
+    panel.grid = element_blank(),
+    
+    # Aggiunto margine per evitare tagli sulle etichette ruotate
+    plot.margin = margin(b = 10)
+  )
+
+print(p3a)
+
+ggsave("grafici_trasparenti/03a_profilo_host.png", plot = p3a, 
+       width = 11, height = 7, bg = "transparent", dpi = 300)
+```
+
+
+> **💡 Messaggio chiave:** il mercato è diviso tra privati (1 alloggio) e operatori multi-property. Il badge Superhost mostra un premio di prezzo visibile — è un obiettivo strategico realistico per un nuovo host. Le regole associative ci diranno quali combinazioni di servizi e comportamenti sono associate al badge.
+
+---
+
+# 4. Stagionalità di domanda e prezzi {#sec-stagionalita}
+
+> **Tecnica collegata:** modello gerarchico con effetto casuale `listing_id` e componente mensile.
+
+```{r stagionalita-tariffa}
+# >>> SLIDE 4-A ─ Tariffa media per mese
+p4a <- mensili %>%
+  group_by(mese) %>%
+  summarise(rate = mean(rate_avg, na.rm = TRUE), .groups = "drop") %>%
+  ggplot(aes(mese, rate)) +
+  geom_area(fill = pal_venezia[2], alpha = 0.15) +
+  geom_line(color = pal_venezia[1], linewidth = 1.2) +
+  geom_point(color = pal_venezia[1], size = 2.5) +
+  scale_x_date(date_labels = "%b %y", date_breaks = "2 months") +
+  scale_y_continuous(limits=c(150,250),labels = dollar_format()) +
+  labs(title = "Tariffa media giornaliera per mese",
+       subtitle = "Picco estivo (lug–ago); secondo picco primaverile",
+       x = NULL, y = "Tariffa media ($)", caption = cap_airroi)
+p4a
+#salva("04a_stagionalita_tariffa", p4a)
+```
+
+
+```{r revenue-mensile}
+# >>> SLIDE 4-E ─ Revenue mensile medio
+p4e <- mensili %>%
+  group_by(mese) %>%
+  summarise(rev = mean(revenue, na.rm = TRUE), .groups = "drop") %>%
+  ggplot(aes(mese, rev)) +
+  geom_col(fill = pal_venezia[1], alpha = 0.85, width = 25) +
+  scale_x_date(date_labels = "%b %y", date_breaks = "2 months") +
+  scale_y_continuous(labels = dollar_format()) +
+  labs(title = "Revenue mensile medio per annuncio",
+       subtitle = "Ottimizzare prezzo × occupazione simultaneamente — non solo il prezzo",
+       x = NULL, y = "Revenue medio ($)", caption = cap_airroi)
+p4e
+salva("04e_revenue_mensile", p4e)
+```
+
+# >>> SLIDE 4-A ─ Tariffa e occupazione — Venezia totale
+
+```{r}
+# >>> SLIDE 4-A ─ Tariffa e occupazione — Venezia totale (Refactoring)
+
+# --- CHUNK 1: PREPARAZIONE DATI (Invariato) ---
+# Aggiungo neighbourhood_cleansed a mensili per il filtro per zona
+mensili <- mensili %>%
+  left_join(
+    airbnb_pulito %>% select(id, neighbourhood_cleansed) %>% rename(listing_id = id),
+    by = "listing_id"
+  )
+
+# Aggregazione totale
+agg_tot <- mensili %>%
+  group_by(mese) %>%
+  summarise(rate = mean(rate_avg,  na.rm = TRUE),
+            occ  = mean(occupancy, na.rm = TRUE),
+            .groups = "drop")
+```
+
+
+```{r}
+# Grafico 1: Solo Tariffa
+p4a_rate <- ggplot(agg_tot, aes(mese, rate, group = 1)) +
+  # Geometria Tariffa (Arancione)
+  geom_line(color = P_ORA, linewidth = 1.2) +
+  geom_point(color = P_ORA, size = 3) +
+  # Asse X: Break impostati a "2 month" per font giganti
+  scale_x_date(date_labels = "%b %Y", date_breaks = "2 month") +
+  scale_y_continuous(
+    name   = "Tariffa media ($)",
+    labels = dollar_format(),
+    # Piccolo margine sopra il punto più alto
+    expand = expansion(mult = c(0, 0.05))
+  ) +
+  labs(title = "Andamento tariffa media a notte — Venezia",
+       subtitle = "Dati storici mensili",
+       x = NULL) +
+  theme(
+    # Grandezze standard slide scure
+    axis.text.y = element_text(color = "white", size = 22, face = "bold"),
+    axis.text.x = element_text(color = "white", size = 17, angle = 35, hjust = 1),
+    # Titolo asse Y bold e colorato come la linea
+    axis.title.y = element_text(color = P_ORA, size = 17, face = "bold"),
+    plot.title = element_text(color = "white", face = "bold", size = 25),
+    plot.subtitle = element_text(color = "white", size = 19, margin = margin(b = 10)),
+    
+    # Sfondi totalmente trasparenti
+    plot.background = element_rect(fill = "transparent", color = NA),
+    panel.background = element_rect(fill = "transparent", color = NA),
+    # Rimozione griglia
+    panel.grid = element_blank(),
+    # Margine extra a destra per sicurezza
+    plot.margin = margin(t = 10, r = 30, b = 10, l = 10)
+  )
+
+print(p4a_rate)
+
+# Salvataggio: altezza ridotta per impilarli
+if(!dir.exists("grafici_trasparenti")) dir.create("grafici_trasparenti")
+ggsave("grafici_trasparenti/04a_tariffa_venezia.png", plot = p4a_rate, 
+       width = 11, height = 4.5, bg = "transparent", dpi = 300)
+```
+
+```{r}
+# Grafico 2: Solo Occupazione
+p4a_occ <- ggplot(agg_tot, aes(mese, occ, group = 1)) +
+  # Geometria Occupazione (Verde, linea continua)
+  geom_line(color = P_VER, linewidth = 1.2) +
+  geom_point(color = P_VER, size = 3) +
+  # Asse X coerente
+  scale_x_date(date_labels = "%b %Y", date_breaks = "2 month") +
+  scale_y_continuous(
+    name   = "Tasso di occupazione",
+    labels = percent_format(accuracy = 1),
+    # Scala fissa 0-100% analiticamente più corretta
+    limits = c(0, 1),
+    expand = c(0, 0)
+  ) +
+  labs(title = "Andamento occupazione per mese — Venezia",
+       subtitle = "Tasso di occupazione (%)",
+       x = NULL, caption = cap_airroi) +
+  theme(
+    # Stesse grandezze standard
+    axis.text.y = element_text(color = "white", size = 22, face = "bold"),
+    axis.text.x = element_text(color = "white", size = 17, angle = 35, hjust = 1),
+    # Titolo asse Y bold e verde
+    axis.title.y = element_text(color = P_VER, size = 17, face = "bold"),
+    plot.title = element_text(color = "white", face = "bold", size = 25),
+    plot.subtitle = element_text(color = "white", size = 19, margin = margin(b = 10)),
+    plot.caption = element_text(color = "white", size = 15),
+    
+    # Trasparenza e rimozione griglia
+    plot.background = element_rect(fill = "transparent", color = NA),
+    panel.background = element_rect(fill = "transparent", color = NA),
+    panel.grid = element_blank(),
+    plot.margin = margin(t = 10, r = 30, b = 10, l = 10)
+  )
+
+print(p4a_occ)
+
+# Salvataggio
+ggsave("grafici_trasparenti/04a_occupazione_venezia.png", plot = p4a_occ, 
+       width = 11, height = 4.5, bg = "transparent", dpi = 300)
+```
+
+
+
+```{r}
+agg_tot <- mensili %>%
+  group_by(mese) %>%
+  summarise(rate = mean(rate_avg,  na.rm = TRUE),
+            occ  = mean(occupancy, na.rm = TRUE),
+            .groups = "drop")
+
+k_tot <- max(agg_tot$rate, na.rm = TRUE)
+
+p4a <- ggplot(agg_tot, aes(mese, group = 1)) +
+  geom_line(aes(y = rate),         color = P_ORA, linewidth = 1.2) +
+  geom_point(aes(y = rate),        color = P_ORA, size = 2.2) +
+  geom_line(aes(y = occ * k_tot),  color = P_VER, linewidth = 1.0, linetype = "dashed") +
+  geom_point(aes(y = occ * k_tot), color = P_VER, size = 2.0) +
+  scale_x_date(date_labels = "%b %Y", date_breaks = "1 month") +
+  scale_y_continuous(
+    name     = "Tariffa media ($)",
+    labels   = dollar_format(),
+    sec.axis = sec_axis(~ . / k_tot,
+                        name   = "Occupazione",
+                        labels = percent_format(accuracy = 1))
+  ) +
+  theme(axis.text.x      = element_text(angle = 35, hjust = 1),
+        axis.title.y.left  = element_text(color = P_ORA),
+        axis.title.y.right = element_text(color = P_VER)) +
+  labs(title    = "Tariffa e occupazione per mese — Venezia",
+       subtitle  = "Arancione: tariffa ($)  ·  Verde: occupazione (%)",
+       x = NULL, caption = cap_airroi)
+p4a
+```
+
+```{r}
+# >>> SLIDE 4-B ─ Tariffa e occupazione — Lido
+
+agg_lido <- mensili %>%
+  filter(neighbourhood_cleansed == "Lido") %>%
+  group_by(mese) %>%
+  summarise(rate = mean(rate_avg,  na.rm = TRUE),
+            occ  = mean(occupancy, na.rm = TRUE),
+            .groups = "drop")
+
+k_lido <- max(agg_lido$rate, na.rm = TRUE)
+
+p4b <- ggplot(agg_lido, aes(mese, group = 1)) +
+  geom_line(aes(y = rate),          color = P_ORA, linewidth = 1.2) +
+  geom_point(aes(y = rate),         color = P_ORA, size = 2.2) +
+  geom_line(aes(y = occ * k_lido),  color = P_VER, linewidth = 1.0, linetype = "dashed") +
+  geom_point(aes(y = occ * k_lido), color = P_VER, size = 2.0) +
+  scale_x_date(date_labels = "%b %Y", date_breaks = "1 month") +
+  scale_y_continuous(
+    name     = "Tariffa media ($)",
+    labels   = dollar_format(),
+    sec.axis = sec_axis(~ . / k_lido,
+                        name   = "Occupazione",
+                        labels = percent_format(accuracy = 1))
+  ) +
+  theme(axis.text.x       = element_text(angle = 35, hjust = 1),
+        axis.title.y.left  = element_text(color = P_ORA),
+        axis.title.y.right = element_text(color = P_VER)) +
+  labs(title    = "Tariffa e occupazione per mese — Lido",
+       subtitle  = "Arancione: tariffa ($)  ·  Verde: occupazione (%)",
+       x = NULL, caption = cap_airroi)
+p4b
+
+```
+
+
+
+
+
+> **💡 Messaggio chiave:** luglio–agosto è il picco tariffario, ma il revenue mensile più alto non coincide sempre con la tariffa più alta (occupazione bassa in alta stagione per chi esagera con il prezzo). La stagionalità varia significativamente per tipologia. Il modello gerarchico (listing_id + mese come effetti) catturerà questa struttura a più livelli.
+
+---
+
+# 5. Reputazione e qualità {#sec-reputazione}
+
+```{r}
+#SOPRA A QUALE NUMERO DI RECENSIONI SI PUO RITENERE AFFIDABILE?
+table(airbnb_pulito$number_of_reviews<5)
+
+```
+
+```{r distribuzione-rating}
+# >>> SLIDE 5-A ─ Distribuzione rating
+p5a <- airbnb_pulito %>%
+  filter(!is.na(review_scores_rating), review_scores_rating >= 3) %>%
+  filter(number_of_reviews >= 5) %>% 
+  ggplot(aes(x = review_scores_rating)) +
+  # Il bordo bianco (color="white") è perfetto per staccare le barre sullo sfondo nero
+  geom_histogram(bins = 35, fill = P_ORA, color = "white", alpha = 0.85) +
+  scale_x_continuous(limits = c(3, 5), breaks = seq(3, 5, 0.5)) +
+  labs(
+    # Inserito a capo (\n) e corretto l'errore di spaziatura prima della parentesi
+    title    = "Distribuzione del punteggio recensioni\n(almeno 5 recensioni)",
+    subtitle = "Forte compressione verso il massimo — quasi tutti sopra 4 stelle",
+    x = "Review score rating (3–5)", 
+    y = "N. annunci",
+    caption = cap_inside
+  ) +
+  theme(
+    # Grandezze esplicite standardizzate per slide scure
+    axis.text.y = element_text(color = "white", size = 22, face = "bold"),
+    axis.text.x = element_text(color = "white", size = 17),
+    axis.title = element_text(color = "white", size = 17),
+    plot.title = element_text(color = "white", face = "bold", size = 25),
+    plot.subtitle = element_text(color = "white", size = 19, margin = margin(b = 10)),
+    plot.caption = element_text(color = "white", size = 15),
+    
+    # Sfondi totalmente trasparenti
+    plot.background = element_rect(fill = "transparent", color = NA),
+    panel.background = element_rect(fill = "transparent", color = NA),
+    
+    # Rimozione totale della griglia
+    panel.grid = element_blank()
+  )
+
+print(p5a)
+ggsave("grafici_trasparenti/05a_distribuzione_rating.png", plot = p5a, 
+       width = 11, height = 6.5, bg = "transparent", dpi = 300)
+```
+
+
+```{r rating-per-host-type}
+# >>> SLIDE 5-C ─ Rating medio per classe di host
+p5c <- airbnb_pulito %>%
+  filter(!is.na(review_scores_rating), !is.na(host_type_classe)) %>%
+  filter(number_of_reviews >= 5)   %>% 
+  group_by(host_type_classe) %>%
+  summarise(rating_medio = mean(review_scores_rating, na.rm = TRUE),
+            n = n(), .groups = "drop") %>%
+  ggplot(aes(x = host_type_classe, y = rating_medio, fill = host_type_classe)) +
+  geom_col(show.legend = FALSE, width = 0.65) +
+  # Testi giganti e bianchi per la lettura su slide
+  geom_text(aes(label = paste0(number(rating_medio, accuracy = 0.01), "\n(n=", n, ")")),
+            vjust = -0.2, size = 7.5, lineheight = 0.9, color = "white", fontface = "bold") +
+  # Mantenuto il limite a 5.2 per non tagliare le etichette, nonostante il limite matematico
+  scale_y_continuous(limits = c(0, 5.2),
+                     expand = expansion(mult = c(0, 0.05))) +
+  scale_fill_manual(values = colorRampPalette(c(P_VER, P_ORA))(
+    n_distinct(airbnb_pulito$host_type_classe[!is.na(airbnb_pulito$host_type_classe)])
+  )) +
+  labs(title    = "Rating medio per classe di host",
+       subtitle = "I privati con un solo alloggio ottengono punteggi più alti?",
+       x = NULL, y = "Rating medio (0–5)", caption = cap_inside) +
+  theme(
+    # Grandezze standardizzate
+    axis.text.y = element_text(color = "white", size = 22, face = "bold"),
+    axis.text.x = element_text(color = "white", size = 17, angle = 20, hjust = 1),
+    axis.title = element_text(color = "white", size = 17),
+    plot.title = element_text(color = "white", face = "bold", size = 25),
+    plot.subtitle = element_text(color = "white", size = 19, margin = margin(b = 10)),
+    plot.caption = element_text(color = "white", size = 15),
+    
+    # Sfondi trasparenti e griglia rimossa
+    plot.background = element_rect(fill = "transparent", color = NA),
+    panel.background = element_rect(fill = "transparent", color = NA),
+    panel.grid = element_blank(),
+    plot.margin = margin(b = 10)
+  )
+
+p5c
+
+ggsave("grafici_trasparenti/05c_rating_per_host_type.png", plot = p5c, 
+       width = 11, height = 8.2, bg = "transparent", dpi = 300)
+```
+
+```{r}
+# >>> SLIDE 5-D ─ Rating medio per sestiere
+p5d <- airbnb_pulito %>%
+  filter(!is.na(review_scores_rating), !is.na(neighbourhood_cleansed)) %>%
+  filter(number_of_reviews >= 5)   %>% 
+  group_by(neighbourhood_cleansed) %>%
+  summarise(rating_medio = mean(review_scores_rating, na.rm = TRUE),
+            n = n(), .groups = "drop") %>%
+  filter(n >= 10) %>%
+  mutate(neighbourhood_cleansed = fct_reorder(neighbourhood_cleansed, rating_medio),
+         colore = case_when(
+           # Lido passa in arancione, Cannaregio finisce nel TRUE (grigio)
+           neighbourhood_cleansed == "Lido"       ~ P_ORA, 
+           TRUE                                   ~ P_GRI
+         )) %>%
+  ggplot(aes(x = rating_medio, y = neighbourhood_cleansed, color = colore)) +
+  # Aumentati gli spessori per bilanciare i font enormi
+  geom_segment(aes(xend = min(rating_medio) - 0.02, yend = neighbourhood_cleansed),
+               linewidth = 1.5, alpha = 0.7) +
+  geom_point(size = 6) +
+  geom_text(aes(label = number(rating_medio, accuracy = 0.01)),
+            hjust = -0.3, size = 7.5, color = "white", fontface = "bold") +
+  scale_color_identity() +
+  scale_x_continuous(expand = expansion(mult = c(0.02, 0.22))) +
+  labs(title    = "Rating medio per sestiere",
+       # Sottotitolo corretto in base ai nuovi colori
+       subtitle = "Il sestiere Lido (arancione) a confronto col resto della città", 
+       x = "Rating medio (0–5)", y = NULL, caption = cap_inside) +
+  theme(
+    axis.text.y = element_text(color = "white", size = 22, face = "bold"),
+    axis.text.x = element_text(color = "white", size = 17),
+    axis.title = element_text(color = "white", size = 17),
+    plot.title = element_text(color = "white", face = "bold", size = 25),
+    plot.subtitle = element_text(color = "white", size = 19, margin = margin(b = 10)),
+    plot.caption = element_text(color = "white", size = 15),
+    
+    plot.background = element_rect(fill = "transparent", color = NA),
+    panel.background = element_rect(fill = "transparent", color = NA),
+    panel.grid = element_blank()
+  )
+
+p5d
+ggsave("grafici_trasparenti/05d_rating_per_sestiere.png", plot = p5d, 
+       width = 11, height = 6.5, bg = "transparent", dpi = 300)
+```
+
+
+
+```{r}
+mensili <- mensili %>%
+  mutate(listing_id = as.character(listing_id)) %>%
+  left_join(
+    airbnb_pulito %>%
+      mutate(listing_id = as.character(id)) %>%
+      select(listing_id, host_type_classe),
+    by = "listing_id"
+  )
+```
+
+```{r}
+# >>> SLIDE 4-A ─ Tariffa e occupazione con fascia di varianza
+
+agg_tot <- mensili %>%
+  group_by(mese) %>%
+  summarise(rate    = mean(rate_avg,  na.rm = TRUE),
+            sd_rate = sd(rate_avg,    na.rm = TRUE),
+            occ     = mean(occupancy, na.rm = TRUE),
+            .groups = "drop")
+
+k_tot <- max(agg_tot$rate, na.rm = TRUE)
+
+p4a <- ggplot(agg_tot, aes(mese, group = 1)) +
+  geom_ribbon(aes(ymin = rate - sd_rate, ymax = rate + sd_rate),
+              fill = P_ORA, alpha = 0.12, color = NA) +
+  geom_line(aes(y = rate),          color = P_ORA, linewidth = 1.2) +
+  geom_point(aes(y = rate),         color = P_ORA, size = 2.2) +
+  geom_line(aes(y = occ * k_tot),   color = P_VER, linewidth = 1.0, linetype = "dashed") +
+  geom_point(aes(y = occ * k_tot),  color = P_VER, size = 2.0) +
+  scale_x_date(date_labels = "%b %Y", date_breaks = "1 month") +
+  scale_y_continuous(
+    name     = "Tariffa media ($)",
+    labels   = dollar_format(),
+    sec.axis = sec_axis(~ . / k_tot,
+                        name   = "Occupazione",
+                        labels = percent_format(accuracy = 1))
+  ) +
+  theme(axis.text.x       = element_text(angle = 35, hjust = 1),
+        axis.title.y.left  = element_text(color = P_ORA),
+        axis.title.y.right = element_text(color = P_VER)) +
+  labs(title    = "Tariffa e occupazione per mese — Venezia",
+       subtitle  = "Arancione: tariffa media ($) con fascia ±1 DS  ·  Verde tratteggio: occupazione (%)",
+       x = NULL, caption = cap_airroi)
+p4a
+salva("04a_stagionalita_venezia", p4a)
+```
+
+```{r}
+# >>> SLIDE 4-D ─ Stagionalità del prezzo: privati vs grandi host
+p4d <- mensili %>%
+  filter(!is.na(host_type_classe)) %>%
+  mutate(categoria = case_when(
+    host_type_classe == "1 alloggio (Privato)"               ~ "Host privato",
+    host_type_classe %in% c("20-99 alloggi (Professionista)",
+                             "100+ alloggi (Grande Agenzia)") ~ "Grande host (20+)",
+    TRUE ~ NA_character_
+  )) %>%
+  filter(!is.na(categoria)) %>%
+  group_by(mese, categoria) %>%
+  summarise(rate = mean(rate_avg, na.rm = TRUE),
+            n    = n_distinct(listing_id),
+            .groups = "drop") %>%
+  ggplot(aes(mese, rate, color = categoria, group = categoria)) +
+  geom_line(linewidth = 1.2) +
+  # Punti leggermente ingranditi (3) per bilanciare i font giganti
+  geom_point(size = 3) +
+  # Break passati a "2 months" per evitare sovrapposizioni delle etichette
+  scale_x_date(date_labels = "%b %Y", date_breaks = "2 months") +
+  scale_y_continuous(labels = dollar_format()) +
+  scale_color_manual(values = c("Host privato"      = P_GRI,
+                                "Grande host (20+)" = P_ORA)) +
+  labs(title    = "Tariffa mensile per tipo di host",
+       subtitle = "I grandi host alzano i prezzi più dei privati in alcuni mesi",
+       x = NULL, y = "Tariffa media ($)",
+       color = NULL, caption = cap_airroi) +
+  theme(
+    # Grandezze esplicite standardizzate per la leggibilità su slide scure
+    axis.text.y = element_text(color = "white", size = 22, face = "bold"),
+    axis.text.x = element_text(color = "white", size = 17, angle = 35, hjust = 1),
+    axis.title = element_text(color = "white", size = 17),
+    plot.title = element_text(color = "white", face = "bold", size = 25),
+    plot.subtitle = element_text(color = "white", size = 19, margin = margin(b = 10)),
+    plot.caption = element_text(color = "white", size = 15),
+    
+    # Adattamento legenda per lo sfondo scuro
+    legend.position = "top",
+    legend.text = element_text(color = "white", size = 17),
+    legend.background = element_rect(fill = "transparent", color = NA),
+    legend.key = element_rect(fill = "transparent", color = NA),
+    
+    # Sfondi totalmente trasparenti
+    plot.background = element_rect(fill = "transparent", color = NA),
+    panel.background = element_rect(fill = "transparent", color = NA),
+    
+    # Rimozione totale della griglia
+    panel.grid = element_blank(),
+    
+    # Margine extra a destra per non tagliare le date
+    plot.margin = margin(t = 10, r = 30, b = 10, l = 10)
+  )
+
+p4d
+
+# Controllo directory e salvataggio
+ggsave("grafici_trasparenti/04d_tariffa_host.png", plot = p4d, 
+       width = 11, height = 6.5, bg = "transparent", dpi = 300)
+```
+
+
+---
+
+# 6. Amenities e prodotto {#sec-amenities}
+
+> **Tecnica collegata:** regole associative (market basket) per identificare bundle di servizi rari ma premianti.
+
+```{r parse-amenities}
+# Le amenities in Inside Airbnb sono una stringa JSON: ["WiFi","Kitchen",...]
+# Estraggo ogni elemento e conto la frequenza
+if ("amenities" %in% names(airbnb_pulito)) {
+  amenities_long <- airbnb_pulito %>%
+    filter(!is.na(amenities)) %>%
+    mutate(am = str_extract_all(amenities, '"([^"]+)"')) %>%
+    select(id, am) %>%
+    unnest(am) %>%
+    mutate(am = str_remove_all(am, '"'),
+           am = str_trim(am)) %>%
+    filter(nchar(am) > 1)
+} else {
+  amenities_long <- tibble(id = character(), am = character())
+  message("Colonna 'amenities' non trovata in airbnb_pulito.")
+}
+```
+
+```{r top-amenities}
+# >>> SLIDE 6-A ─ Le 20 amenities più diffuse
+if (nrow(amenities_long) > 0) {
+  p6a <- amenities_long %>%
+    count(am, sort = TRUE) %>%
+    slice_head(n = 20) %>%
+    mutate(quota = n / n_distinct(airbnb_pulito$id),
+           am    = fct_reorder(am, quota)) %>%
+    ggplot(aes(quota, am)) +
+    geom_segment(aes(xend = 0, yend = am), color = "grey70", linewidth = 0.5) +
+    geom_point(aes(size = quota), color = pal_venezia[2], alpha = 0.85) +
+    geom_text(aes(label = percent(quota, accuracy = 1)),
+              hjust = -0.5, size = 3.0) +
+    scale_x_continuous(labels = percent_format(),
+                       expand = expansion(mult = c(0, 0.18))) +
+    scale_size_continuous(range = c(2, 7), guide = "none") +
+    labs(title = "Le 20 amenities più diffuse",
+         subtitle = "Quota degli annunci che includono l'amenity",
+         x = "% annunci", y = NULL, caption = cap_inside)
+p6a
+  salva("06a_top_amenities", p6a, h = 5.8)
+} else {
+  message("Nessun dato amenities disponibile.")
+}
+```
+
+```{r amenities-rare-premium}
+# >>> SLIDE 6-B ─ Amenities meno comuni: differenziatori potenziali
+# Soglia: tra il 5% e il 40% degli annunci (né scontate né rarissime)
+if (nrow(amenities_long) > 0) {
+  n_annunci <- n_distinct(airbnb_pulito$id)
+  p6b <- amenities_long %>%
+    count(am, sort = TRUE) %>%
+    mutate(quota = n / n_annunci) %>%
+    filter(between(quota, 0.05, 0.40)) %>%
+    slice_head(n = 20) %>%
+    mutate(am = fct_reorder(am, quota)) %>%
+    ggplot(aes(quota, am)) +
+    geom_col(fill = pal_venezia[4], width = 0.7, alpha = 0.85) +
+    geom_text(aes(label = percent(quota, accuracy = 1)),
+              hjust = -0.1, size = 3.0) +
+    scale_x_continuous(labels = percent_format(),
+                       expand = expansion(mult = c(0, 0.16))) +
+    labs(title = "Amenities differenzianti (presenza 5%–40%)",
+         subtitle = "Non scontate, non rarissime — il terreno delle regole associative",
+         x = "% annunci", y = NULL, caption = cap_inside)
+p6b
+  salva("06b_amenities_differenzianti", p6b, h = 5.8)
+} else {
+  message("Nessun dato amenities disponibile.")
+}
+
+```
+
+```{r}
+
+```
+
+> **💡 Messaggio chiave:** le amenities di base (WiFi, cucina, lavatrice) sono quasi universali — non differenziano. Le regole associative lavoreranno sulla fascia intermedia (5%–40%) per trovare bundle inusuali che si associano a prezzi o rating più alti: quelli sono i veri investimenti da fare prima di aprire.
+
+---
+
+# 7. ESPLORATIVE SU UN PO TUTTO :) 
+
+```{r}
+# >>> SLIDE — Profilo delle zone: summary variabili per sestiere
+
+# ── 1. Calcolo statistiche per zona ─────────────────────────────────────────
+summary_zone <- airbnb_pulito %>%
+  filter(!is.na(neighbourhood_cleansed)) %>%
+  group_by(neighbourhood_cleansed) %>%
+  filter(n() >= 20) %>%
+  summarise(
+    # Assegnati nomi puliti e aggiunto na.rm = TRUE obbligatorio per le medie
+    `Ospiti` = mean(accommodates, na.rm = TRUE), 
+    `Bagni` = mean(bathrooms, na.rm = TRUE),
+    `Stanze` = mean(bedrooms, na.rm = TRUE),
+    `Notti min.` = mean(minimum_nights_avg_ntm, na.rm = TRUE),
+    `N. Recensioni` = mean(number_of_reviews, na.rm = TRUE),
+    `Accuracy` = mean(review_scores_accuracy, na.rm = TRUE),
+    `Pulizia` = mean(review_scores_cleanliness, na.rm = TRUE),
+    `Check-in` = mean(review_scores_checkin, na.rm = TRUE),
+    `Comunicazione` = mean(review_scores_communication, na.rm = TRUE),
+    `Location` = mean(review_scores_location, na.rm = TRUE),
+    `N.\nannunci` = n(),
+    .groups = "drop"
+  ) %>%
+  # Modificato l'ordinamento: Prezzo mediano non è stato calcolato, usiamo la numerosità
+  arrange(desc(`N.\nannunci`))
+
+# ── 2. Formato lungo + normalizzazione per colonna (per i colori) ────────────
+summary_long <- summary_zone %>%
+  pivot_longer(-neighbourhood_cleansed,
+               names_to  = "variabile",
+               values_to = "valore") %>%
+  group_by(variabile) %>%
+  # Aggiunto na.rm = TRUE anche qui per sicurezza
+  mutate(valore_norm = (valore - min(valore, na.rm = TRUE)) / (max(valore, na.rm = TRUE) - min(valore, na.rm = TRUE))) %>%
+  ungroup() %>%
+  mutate(
+    # Etichette aggiornate sulle nuove variabili calcolate al punto 1
+    etichetta = case_when(
+      variabile %in% c("Accuracy", "Pulizia", "Check-in", "Comunicazione", "Location") ~ number(valore, accuracy = 0.01),
+      variabile %in% c("Ospiti", "Bagni", "Stanze", "Notti min.") ~ number(valore, accuracy = 0.1),
+      variabile == "Recensioni" ~ number(valore, accuracy = 1),
+      variabile == "N.\nannunci" ~ as.character(round(valore)),
+      TRUE ~ number(valore, accuracy = 0.1)
+    ),
+    # Ordine zone (per numero annunci decrescente)
+    neighbourhood_cleansed = factor(neighbourhood_cleansed,
+                                    levels = summary_zone$neighbourhood_cleansed),
+    # Ordine logico per le colonne nel grafico
+    variabile = factor(variabile,
+                       levels = c("N.\nannunci", "Ospiti", "Stanze", "Bagni", "Notti min.", 
+                                  "N. Recensioni", "Accuracy", "Pulizia", "Check-in", 
+                                  "Comunicazione", "Location"))
+  )
+
+# ── 3. Colori etichette asse y: verde Lido, arancione Cannaregio ─────────────
+zone_ordinate <- levels(summary_long$neighbourhood_cleansed)
+col_zone <- case_when(
+  zone_ordinate == "Lido"       ~ P_VER,
+  zone_ordinate == "Cannaregio" ~ P_ORA,
+  TRUE                          ~ "grey25"
+)
+
+# ── 4. Grafico ───────────────────────────────────────────────────────────────
+p_summary <- ggplot(summary_long,
+                    aes(variabile, neighbourhood_cleansed, fill = valore_norm)) +
+  geom_tile(color = "white", linewidth = 0.5) +
+  geom_text(aes(label = etichetta,
+                color  = if_else(valore_norm > 0.65, "white", "grey15")),
+            size = 3.1, fontface = "bold") +
+  scale_fill_gradient(low = "white", high = P_ORA, na.value = "grey90",
+                      guide = "none") +
+  scale_color_identity() +
+  theme(
+    axis.text.y = element_text(color = "white", face = "bold", size = 11),
+    # Aggiunta inclinazione dell'asse X (angle = 15) per evitare la sovrapposizione dei testi
+    axis.text.x = element_text(size = 10, lineheight = 0.9, angle = 15, hjust = 1,color="white"),
+    panel.grid  = element_blank(),
+    plot.background = element_rect(fill = "transparent", color = NA),
+    panel.background = element_rect(fill = "transparent", color = NA)
+  ) +
+  labs(title    = "Profilo delle zone Airbnb — alcuni indicatori per sestiere",
+       subtitle = "Colore più scuro = valore più alto",
+       x = NULL, y = NULL, caption = cap_inside)+
+  theme(
+    plot.title = element_text(color = "white"),
+    plot.subtitle = element_text(color = "white"),
+    plot.caption = element_text(color = "white")
+  )
+
+p_summary
+salva("00_summari_zone.png", 
+       p = p_summary, 
+       w = 10, 
+       h = 6)
+```
+

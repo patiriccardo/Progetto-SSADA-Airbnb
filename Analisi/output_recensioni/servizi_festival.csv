@@ -1,0 +1,19 @@
+servizio,menzioni,menzioni_negative,sentiment_medio,quota_negativa
+Acqua calda,1,0,-0.398,1
+Asciugacapelli,1,0,0,0
+Lavatrice / lavanderia,7,2,0.122,0.286
+Wi-Fi / internet,9,4,0.123,0.444
+Doccia / pressione acqua,6,1,0.129,0.167
+Ascensore,1,0,0.175,0
+Parcheggio,1,0,0.25,0
+Cucina / attrezzatura,15,4,0.283,0.2
+Aria condizionata,9,4,0.288,0.111
+Caffe / bollitore,4,2,0.31,0.25
+Reception / check-in,11,5,0.342,0.182
+Rumore / insonorizzazione,26,4,0.43,0.115
+Pulizia,29,5,0.624,0.069
+Scale (ripide),1,0,0.691,0
+Colazione,2,0,0.792,0
+Riscaldamento,0,0,,
+Asciugamani / biancheria,0,0,,
+TV,0,0,,

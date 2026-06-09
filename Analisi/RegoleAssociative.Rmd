@@ -1,0 +1,752 @@
+---
+title: "Regole associative — Amenities degli Airbnb veneziani"
+subtitle: "Market Basket Analysis · Strumenti statistici per dati aziendali"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    theme: flatly
+    highlight: tango
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  fig.width = 9, fig.height = 5.2, dpi = 150
+)
+```
+
+---
+
+# 0. Setup e dati
+
+```{r librerie}
+library(tidyverse)
+library(arules)
+library(arulesViz)
+library(scales)
+library(kableExtra)
+```
+
+```{r palette}
+P_ORA <- "#F36F21"
+P_VER <- "#006241"
+P_GRI <- "#8C9A9E"
+P_NAV <- "#1A2030"
+
+cap_ins <- "Inside Airbnb — 5.811 annunci, fotografia al 15/09/2025"
+cap_air <- "AirROI — 250 annunci, dati mensili 05/2025–04/2026"
+```
+
+```{r carico-dati}
+load("../dati/airbnb_pulito.Rdata")   # airbnb_pulito: 5811 × ~51
+load("../dati/airroi_pulito.Rdata")   # airroi_pulito: 250 × ~17
+```
+
+```{r helpers}
+# Helper: salva PNG slide-ready in analisi/grafici/
+dir.create("grafici", showWarnings = FALSE)
+salva <- function(nome, p = last_plot(), w = 9, h = 5.2)
+  ggsave(file.path("grafici_trasparenti", paste0(nome, ".png")),
+         p, width = w, height = h, dpi = 300, bg = "transparent")
+
+# Lollipop chart per regole associative — sostituisce method="graph" (archi invisibili)
+# Ogni punto è una regola: asse x = lift, colore = confidence, dimensione = support
+plot_regole_lollipop <- function(regole, n = 15, titolo = NULL, sottotitolo = NULL) {
+  top_n <- head(sort(regole, by = "lift"), n = n)
+  as(top_n, "data.frame") %>%
+    mutate(
+      rules = str_wrap(rules, width = 50),
+      rules = fct_reorder(rules, lift)
+    ) %>%
+    ggplot(aes(lift, rules)) +
+    geom_segment(aes(xend = 1, yend = rules), color = "grey50", linewidth = 0.8) +
+    geom_point(aes(size = support, color = confidence), alpha = 0.85) +
+    geom_vline(xintercept = 1, linetype = "dashed", color = "grey50") +
+    scale_color_gradient(low = P_GRI, high = P_ORA,
+                         labels = percent_format(accuracy = 1)) +
+    scale_size_continuous(range = c(2, 7),
+                          labels = percent_format(accuracy = 1)) +
+    labs(title = titolo, subtitle = sottotitolo,
+         x = "Lift  (> 1 = co-occorrenza non casuale)",
+         y = NULL, size = "Support", color = "Confidence") +
+    theme_minimal(base_size = 12) +
+    theme(
+      panel.grid        = element_blank(),
+      plot.background   = element_rect(fill = "transparent", color = NA),
+      panel.background  = element_rect(fill = "transparent", color = NA),
+      legend.background = element_rect(fill = "transparent", color = NA),
+      legend.key        = element_rect(fill = "transparent", color = NA),
+      plot.title        = element_text(face = "bold", color = "white"),
+      plot.subtitle     = element_text(color = "white"),
+      plot.caption      = element_text(color = "white"),
+      axis.text.y       = element_text(color = "white", size = 15, face = "bold"),
+      axis.text.x       = element_text(color = "white"),
+      axis.title        = element_text(color = "white"),
+      legend.text       = element_text(color = "white"),
+      legend.title      = element_text(color = "white"),
+      legend.position   = "right"
+    )
+}
+```
+
+> **Logica MBA applicata agli Airbnb.**
+> In un negozio, ogni *transazione* è uno scontrino e gli *item* sono i prodotti.
+> Qui ogni *transazione* è un **annuncio** e ogni *item* è un'**amenity** (WiFi,
+> lavatrice, piscina, …). Cerchiamo bundle di servizi che compaiono spesso insieme
+> e — cosa più interessante — quelli associati a **rating superiori** o a
+> **prezzi più alti**: le leve su cui i due hotel possono differenziarsi.
+
+---
+
+# 1. Preparazione delle transazioni
+
+## 1.1 Parsing delle amenities
+
+```{r parsing-amenities}
+# Le amenities in Inside Airbnb sono una stringa JSON tipo:
+# ["WiFi","Kitchen","Heating","Air conditioning","Washer"]
+# Estraggo ogni elemento e creo una riga per coppia (listing_id, amenity).
+
+am_long <- airbnb_pulito %>%
+  filter(!is.na(amenities), amenities != "[]") %>%
+  mutate(id = as.character(id)) %>%
+  select(id, neighbourhood_cleansed, room_type, price_num, host_is_superhost,
+         amenities) %>%
+  mutate(am_list = str_extract_all(amenities, '"([^",\\[\\]]+)"')) %>%
+  select(-amenities) %>%
+  unnest(am_list) %>%
+  mutate(am_list = str_remove_all(am_list, '"'),
+         am_list = str_trim(am_list)) %>%
+  filter(nchar(am_list) > 1) %>%
+  rename(amenity = am_list)
+
+cat("Annunci con almeno un'amenity:", n_distinct(am_long$id), "\n")
+cat("Amenities uniche:", n_distinct(am_long$amenity), "\n")
+cat("Coppie (listing, amenity):", nrow(am_long), "\n")
+```
+
+```{r traduci-amenities}
+# Dizionario inglese → italiano per le amenities Inside Airbnb
+# Le voci non mappate rimangono in inglese (via coalesce)
+dizionario <- c(
+  # Connettività e intrattenimento
+  "Wifi"                                    = "WiFi",
+  "WiFi"                                    = "WiFi",
+  "TV"                                      = "TV",
+  "Cable TV"                                = "TV via cavo",
+  "Netflix"                                 = "Netflix",
+  "Amazon Prime Video"                      = "Amazon Prime Video",
+  "Disney+"                                 = "Disney+",
+  "HBO Max"                                 = "HBO Max",
+  "Streaming services"                      = "Servizi streaming",
+  "Sound system"                            = "Impianto audio",
+  "Game console"                            = "Console videogiochi",
+  "Books and reading material"              = "Libri e riviste",
+
+  # Cucina e cibo
+  "Kitchen"                                 = "Cucina",
+  "Kitchenette"                             = "Angolo cottura",
+  "Cooking basics"                          = "Attrezzatura base cucina",
+  "Dishes and silverware"                   = "Piatti e posate",
+  "Refrigerator"                            = "Frigorifero",
+  "Microwave"                               = "Microonde",
+  "Oven"                                    = "Forno",
+  "Stove"                                   = "Fornelli",
+  "Dishwasher"                              = "Lavastoviglie",
+  "Coffee maker"                            = "Macchina del caffè",
+  "Coffee"                                  = "Caffè",
+  "Espresso machine"                        = "Macchina per espresso",
+  "Kettle"                                  = "Bollitore",
+  "Hot water kettle"                        = "Bollitore",
+  "Toaster"                                 = "Tostapane",
+  "Blender"                                 = "Frullatore",
+  "Rice maker"                              = "Cuociriso",
+  "Bread maker"                             = "Macchina del pane",
+  "Wine glasses"                            = "Bicchieri da vino",
+  "Dining table"                            = "Tavolo da pranzo",
+  "Ice maker"                               = "Fabbricatore di ghiaccio",
+  "BBQ grill"                               = "Barbecue",
+  "Outdoor dining area"                     = "Area pranzo esterna",
+
+  # Bagno e cura personale
+  "Hot water"                               = "Acqua calda",
+  "Bathtub"                                 = "Vasca da bagno",
+  "Hair dryer"                              = "Asciugacapelli",
+  "Shampoo"                                 = "Shampoo",
+  "Conditioner"                             = "Balsamo",
+  "Body soap"                               = "Sapone per il corpo",
+  "Shower gel"                              = "Gel doccia",
+  "Bath essentials"                         = "Prodotti da bagno",
+  "Bidet"                                   = "Bidet",
+  "Handheld shower head"                    = "Soffione a mano",
+  "Shower chair"                            = "Sedia doccia",
+  "Grab-rails for shower and toilet"        = "Maniglioni doccia e WC",
+  "Tub with shower bench"                   = "Vasca con sedile",
+
+  # Camera e comfort
+  "Bed linens"                              = "Biancheria da letto",
+  "Extra pillows and blankets"              = "Cuscini e coperte extra",
+  "Hangers"                                 = "Grucce",
+  "Iron"                                    = "Ferro da stiro",
+  "Clothing storage"                        = "Armadio / cassettiera",
+  "Safe"                                    = "Cassaforte",
+  "Blackout shades"                         = "Tende oscuranti",
+  "Room-darkening shades"                   = "Tende oscuranti",
+  "Indoor fireplace"                        = "Camino interno",
+  "Air conditioning"                        = "Aria condizionata",
+  "Heating"                                 = "Riscaldamento",
+
+  # Lavanderia
+  "Washer"                                  = "Lavatrice",
+  "Dryer"                                   = "Asciugatrice",
+  "Washer / dryer"                          = "Lavatrice / asciugatrice",
+
+  # Lavoro
+  "Dedicated workspace"                     = "Scrivania dedicata",
+  "Laptop-friendly workspace"               = "Spazio lavoro per laptop",
+
+  # Sicurezza
+  "Smoke alarm"                             = "Rilevatore di fumo",
+  "Carbon monoxide alarm"                   = "Rilevatore CO",
+  "Fire extinguisher"                       = "Estintore",
+  "First aid kit"                           = "Kit pronto soccorso",
+
+  # Check-in e accesso
+  "Self check-in"                           = "Check-in autonomo",
+  "Lockbox"                                 = "Cassettina portachiavi",
+  "Keypad"                                  = "Tastierino numerico",
+  "Smart lock"                              = "Serratura smart",
+  "Private entrance"                        = "Ingresso privato",
+  "Luggage dropoff allowed"                 = "Deposito bagagli consentito",
+  "Long term stays allowed"                 = "Soggiorni lunghi consentiti",
+
+  # Essenziali
+  "Essentials"                              = "Essenziali",
+  "Towels"                                  = "Asciugamani",
+  "Toilet paper"                            = "Carta igienica",
+
+  # Spazi esterni e sport
+  "Patio or balcony"                        = "Patio o balcone",
+  "Private patio or balcony"                = "Patio o balcone privato",
+  "Shared patio or balcony"                 = "Patio/balcone condiviso",
+  "Garden or backyard"                      = "Giardino o cortile",
+  "Outdoor furniture"                       = "Arredo esterno",
+  "Private pool"                            = "Piscina",
+  "Shared pool"                             = "Piscina",
+  "Pool"                                    = "Piscina",
+  "Hot tub"                                 = "Vasca idromassaggio",
+  "Sauna"                                   = "Sauna",
+  "Gym"                                     = "Palestra",
+  "Exercise equipment"                      = "Attrezzi fitness",
+  "Bikes"                                   = "Biciclette",
+  "Kayak"                                   = "Kayak",
+  "Beach access"                            = "Accesso alla spiaggia",
+  "Waterfront"                              = "Affaccio sull'acqua",
+  "Lake access"                             = "Accesso al lago",
+
+  # Viste (tipiche di Venezia)
+  "Canal view"                              = "Vista sul canale",
+  "City skyline view"                       = "Vista sulla città",
+  "Mountain view"                           = "Vista sulle montagne",
+  "Garden view"                             = "Vista sul giardino",
+  "Courtyard view"                          = "Vista sul cortile",
+
+  # Parcheggio
+  "Free parking on premises"                = "Parcheggio gratuito",
+  "Paid parking on premises"                = "Parcheggio a pagamento in loco",
+  "Free parking on street"                  = "Parcheggio gratuito",
+  "Free street parking"                     = "Parcheggio gratuito",
+  "Paid parking off premises"               = "Parcheggio a pagamento esterno",
+  "EV charger"                              = "Colonnina ricarica EV",
+
+  # Bambini
+  "Crib"                                    = "Lettino neonato",
+  "Baby crib"                               = "Lettino neonato",
+  "Pack 'n play/travel crib"                = "Lettino da viaggio",
+  "High chair"                              = "Seggiolone",
+  "Children's books and toys"               = "Libri e giocattoli per bambini",
+  "Children's dinnerware"                   = "Stoviglie per bambini",
+  "Baby bath"                               = "Vaschetta per bagnetto",
+  "Baby monitor"                            = "Baby monitor",
+  "Window guards"                           = "Protezioni finestre",
+  "Outlet covers"                           = "Copriprese",
+  "Table corner guards"                     = "Protezioni angoli tavolo",
+  "Babysitter recommendations"              = "Consigli baby-sitter",
+
+  # Accessibilità
+  "Elevator"                                = "Ascensore",
+  "Step-free access"                        = "Accesso senza scalini",
+  "Single level home"                       = "Casa su un piano solo",
+  "Wide hallway clearance"                  = "Corridoio largo",
+  "Accessible-height bed"                   = "Letto ad altezza accessibile",
+  "Accessible-height toilet"                = "WC ad altezza accessibile",
+
+  # Animali
+  "Pets allowed"                            = "Animali ammessi",
+  "Cat(s)"                                  = "Animali ammessi",
+  "Dog(s)"                                  = "Animali ammessi"
+)
+
+# Applico la traduzione: le voci non presenti nel dizionario restano in inglese
+am_long <- am_long %>%
+  mutate(amenity = coalesce(dizionario[amenity], amenity))
+
+cat("Traduzione applicata — amenities uniche ora:", n_distinct(am_long$amenity), "\n")
+```
+
+## 1.2 Analisi esplorativa delle frequenze
+
+```{r freq-amenities}
+# Numero medio di amenities per annuncio
+am_long %>%
+  count(id) %>%
+  summarise(
+    media   = mean(n),
+    mediana = median(n),
+    min     = min(n),
+    max     = max(n)
+  ) %>%
+  kable(caption = "Statistiche sul numero di amenities per annuncio",
+        digits = 1) %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r top-amenities-plot}
+# Top 25 amenities per frequenza
+freq_tab <- am_long %>%
+  count(amenity, sort = TRUE) %>%
+  mutate(quota = n / n_distinct(am_long$id))
+
+# Creazione del grafico con il tema standard per slide
+p_top25 <- freq_tab %>%
+  slice_head(n = 25) %>%
+  mutate(amenity = fct_reorder(amenity, quota)) %>%
+  ggplot(aes(quota, amenity)) +
+  geom_col(fill = P_GRI, alpha = 0.85, width = 0.7) +
+  # Dimensione testo proporzionata agli assi (size = 7.5), colore bianco
+  geom_text(aes(label = percent(quota, accuracy = 1)),
+            hjust = -0.2, size = 7.5, color = "white", fontface = "bold") +
+  # Espansione aumentata per non tagliare le etichette a destra
+  scale_x_continuous(labels = percent_format(),
+                     expand = expansion(mult = c(0, 0.18))) +
+  # Corretto l'errore di battitura in cap_inside
+  labs(title = "Le 25 amenities più diffuse",
+       subtitle = "Quota degli annunci che includono ogni servizio",
+       x = "% annunci", y = NULL, caption = cap_ins) +
+  theme(
+    # Grandezze esplicite
+    axis.text.y = element_text(color = "white", size = 22, face = "bold"),
+    axis.text.x = element_text(color = "white", size = 17),
+    axis.title = element_text(color = "white", size = 17),
+    plot.title = element_text(color = "white", face = "bold", size = 25),
+    plot.subtitle = element_text(color = "white", size = 19, margin = margin(b = 10)),
+    plot.caption = element_text(color = "white", size = 15),
+    
+    # Sfondi totalmente trasparenti
+    plot.background = element_rect(fill = "transparent", color = NA),
+    panel.background = element_rect(fill = "transparent", color = NA),
+    
+    # Rimozione totale della griglia
+    panel.grid = element_blank()
+  )
+p_top25
+
+ggsave("grafici_trasparenti/top25_amenities.png", plot = p_top25, width = 11, height = 9, bg = "transparent", dpi = 300)
+```
+
+```{r amenities-differenzianti}
+# Fascia "differenziante": presente nel 5–40% degli annunci
+# Né commodity (>80%) né rarità (<5%)
+differenzianti <- freq_tab %>%
+  filter(between(quota, 0.05, 0.40)) %>%
+  arrange(desc(quota))
+
+cat("Amenities nella fascia differenziante (5%-40%):", nrow(differenzianti), "\n")
+differenzianti %>%
+  slice_head(n = 20) %>%
+  kable(col.names = c("Amenity", "N annunci", "Quota"),
+        digits = c(0, 0, 3),
+        caption = "Top 20 amenities differenzianti (fascia 5%–40%)") %>%
+  kable_styling(full_width = FALSE)
+```
+
+## 1.3 Creazione oggetto `transactions`
+
+```{r crea-transactions}
+# Metodo: split per id (analogo alla playlist del lab lastfm)
+# Ogni annuncio è una "transazione", le amenities sono gli "item"
+transazioni_list <- split(am_long$amenity, am_long$id)
+
+# Rimuovo duplicati (un annuncio non può avere la stessa amenity due volte)
+transazioni_list <- lapply(transazioni_list, unique)
+
+# Converto in oggetto transactions di arules
+trans <- as(transazioni_list, "transactions")
+trans
+
+summary(trans)
+```
+
+
+---
+
+# 2. Regole associative — visione d'insieme
+
+## 2.1 Apriori: tutti gli annunci
+
+```{r apriori-base}
+# Parametri di partenza analoghi al lab (adattati per amenities):
+# support = 0.10 → un bundle deve comparire in almeno 10% degli annunci (~580 listingsco)
+# confidence = 0.60 → se un annuncio ha A, nel 60% dei casi ha anche B
+# minlen = 2 → almeno 2 item per regola (esclude regole banali con 1 item)
+regole <- apriori(
+  trans,
+  parameter = list(supp = 0.10, conf = 0.60, minlen = 2, maxlen = 5)
+)
+cat("Regole trovate:", length(regole), "\n")
+inspect(head(sort(regole, by = "lift"), n = 10))
+```
+
+## 2.2 Regole con lift elevato (le più "sorprendenti")
+
+```{r regole-lift}
+# Lift > 1 → A e B compaiono INSIEME più spesso di quanto ci si aspetterebbe
+# Lift alto = co-occorrenza non banale → bundle "naturale" o strategico
+regole_lift <- subset(regole, lift > 2)
+cat("Regole con lift > 2:", length(regole_lift), "\n")
+
+```
+
+```{r plot-graph-lift, fig.height=5.5}
+plot_regole_lollipop(
+  regole_lift, n = 15,
+  titolo     = "Top 15 regole per lift — bundle di amenities non ovvie",
+  sottotitolo = "Tutti gli annunci veneziani"
+)
+```
+
+---
+
+# 3. Amenities differenzianti (fascia 5%–40%)
+
+> Commodity come WiFi e cucina non generano regole interessanti (troppo frequenti).
+> Lavoriamo sulla fascia differenziante, cioè le amenities che *non* sono universali
+> ma non sono nemmeno rarissime: è qui che si gioca la competizione.
+
+```{r trans-differenzianti}
+# Ricreo le transazioni con sole amenities differenzianti (5%–40% support)
+item_diff <- differenzianti$amenity
+
+am_diff <- am_long %>%
+  filter(amenity %in% item_diff)
+
+trans_diff_list <- split(am_diff$amenity, am_diff$id)
+trans_diff_list  <- lapply(trans_diff_list, unique)
+
+# Tengo solo i listing che hanno almeno 2 amenities differenzianti
+trans_diff_list  <- trans_diff_list[sapply(trans_diff_list, length) >= 2]
+trans_diff       <- as(trans_diff_list, "transactions")
+
+cat("Annunci con ≥2 amenities differenzianti:", length(trans_diff_list), "\n")
+```
+
+```{r apriori-diff}
+# Soglie più basse perché le amenities differenzianti sono meno frequenti
+regole_diff <- apriori(
+  trans_diff,
+  parameter = list(supp = 0.05, conf = 0.60, minlen = 2, maxlen = 4)
+)
+cat("Regole trovate (amenities differenzianti):", length(regole_diff), "\n")
+
+# Top per lift
+inspect(head(sort(regole_diff, by = "lift"), n = 12))
+```
+
+```{r plot-diff-graph, fig.height=5.5}
+plot_regole_lollipop(
+  regole_diff, n = 20,
+  titolo      = "Bundle di amenities differenzianti (top 20 per lift)",
+  sottotitolo = "Fascia 5%–40% di diffusione — né commodity né rarità"
+)
+```
+
+---
+# 4. Focus sul territorio — Cannaregio vs Lido
+
+> **Il Canaletto** opera a Cannaregio, **Lido Sands** al Lido. I pattern di amenities
+> dei competitor nelle due zone sono diversi?  Le regole ci dicono:
+> - *Cosa offrono quasi tutti* (commodity locale, inutile differenziarsi)
+> - *Cosa offrono in pochi con alto lift* (opportunità di differenziazione)
+
+```{r split-zone}
+id_lido <- airbnb_pulito %>%
+  filter(neighbourhood_cleansed == "Lido") %>%
+  pull(id) %>% as.character()
+
+cat("Annunci al Lido:     ", length(id_lido), "\n")
+```
+
+
+## 5.1 Lido — competitor del Lido Sands
+
+```{r trans-lido}
+trans_lido_list <- transazioni_list[names(transazioni_list) %in% id_lido]
+trans_lido      <- as(trans_lido_list, "transactions")
+
+cat("Transazioni Lido:", length(trans_lido_list), "\n")
+cat("Top 10 amenities al Lido:\n")
+print(sort(itemFrequency(trans_lido), decreasing = TRUE)[1:10])
+```
+
+```{r apriori-lido}
+# Support più basso perché il Lido ha meno annunci
+regole_lido <- apriori(
+  trans_lido,
+  parameter = list(supp = 0.08, conf = 0.60, minlen = 2, maxlen = 4)
+)
+cat("Regole Lido:", length(regole_lido), "\n")
+
+cat("\nTop regole per lift al Lido:\n")
+inspect(head(sort(regole_lido, by = "lift"), n = 10))
+```
+
+```{r plot-lido, fig.height=5}
+plot_regole_lollipop(
+  regole_lido, n = 15,
+  titolo      = "Bundle di amenities al Lido",
+  sottotitolo = "Competitor del Lido Sands"
+)
+```
+
+## 5.2 Confronto diretto: Resto di Venezia vs Lido
+
+```{r confronto-zone}
+# Tutti gli annunci fuori dal Lido ("resto di Venezia")
+id_resto <- airbnb_pulito %>%
+  filter(neighbourhood_cleansed != "Lido") %>%
+  pull(id) %>% as.character()
+
+trans_resto_list <- transazioni_list[names(transazioni_list) %in% id_resto]
+trans_resto      <- as(trans_resto_list, "transactions")
+
+cat("Annunci fuori dal Lido (resto di Venezia):", length(trans_resto_list), "\n")
+
+# Confronto frequenze amenities differenzianti
+freq_resto <- itemFrequency(trans_resto)
+freq_lido  <- itemFrequency(trans_lido)
+
+# Item presenti in entrambi i dataset
+item_comuni <- intersect(names(freq_resto), names(freq_lido))
+
+# Solo amenities differenzianti (5–90% almeno in una zona)
+diff_zone <- tibble(
+  amenity = item_comuni,
+  resto   = freq_resto[item_comuni],
+  lido    = freq_lido[item_comuni]
+) %>%
+  filter(resto >= 0.05 | lido >= 0.05,
+         resto <= 0.90, lido <= 0.90) %>%
+  mutate(delta = lido - resto) %>%
+  arrange(desc(abs(delta)))
+
+cat("Amenities con maggiore differenza Lido vs Resto di Venezia:\n")
+diff_zone %>%
+  slice_head(n = 20) %>%
+  kable(col.names = c("Amenity", "Resto di Venezia", "Lido", "Δ (Lido − Resto)"),
+        digits = 3,
+        caption = "Differenze nelle amenities: Lido vs Resto di Venezia") %>%
+  kable_styling(full_width = FALSE) %>%
+  column_spec(4, color = ifelse(
+    diff_zone %>% slice_head(n=20) %>% pull(delta) > 0, P_VER, P_ORA
+  ), bold = TRUE)
+```
+
+```{r plot-confronto, fig.height=5.5}
+p_confronto <- diff_zone %>%
+  slice_head(n = 15) %>%                                        # tolte le ultime 5
+  mutate(amenity = fct_reorder(amenity, lido)) %>%
+  pivot_longer(c(resto, lido), names_to = "zona", values_to = "freq") %>%
+  mutate(
+    zona = factor(zona, levels = c("resto", "lido"),
+                  labels = c("Resto di Venezia",
+                             "Lido (Lido Sands)"))
+  ) %>%
+  ggplot(aes(freq, amenity, color = zona)) +
+  geom_line(aes(group = amenity), color = "grey60", linewidth = 0.8) +
+  geom_point(size = 3.5, alpha = 0.9) +
+  scale_x_continuous(labels = percent_format(accuracy = 1)) +
+  scale_color_manual(values = c("Resto di Venezia"  = P_VER,
+                                "Lido (Lido Sands)" = P_ORA)) +
+  labs(
+    title   = "Amenities più diverse tra Lido e il resto di Venezia",
+    x = "Frequenza (% annunci nella zona)", y = NULL,
+    color = NULL, caption = cap_ins
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    panel.grid        = element_blank(),
+
+    plot.background   = element_rect(fill = "transparent", color = NA),
+    panel.background  = element_rect(fill = "transparent", color = NA),
+    legend.background = element_rect(fill = "transparent", color = NA),
+    legend.key        = element_rect(fill = "transparent", color = NA),
+
+    plot.title        = element_text(face = "bold", color = "white", size = 16),
+    plot.caption      = element_text(color = "white"),
+    axis.text.y       = element_text(color = "white", size = 15, face = "bold"), # scritte righe più grandi
+    axis.text.x       = element_text(color = "white", size = 12),
+    axis.title        = element_text(color = "white"),
+    legend.text       = element_text(color = "white", size = 13),
+    legend.position   = "top"
+  )
+
+p_confronto
+salva("confronto_lido_resto", p_confronto, w = 9, h = 6)
+```
+
+---
+
+# 6. Amenities associate a rating alto e prezzo alto
+
+> Per i due hotel la domanda operativa è: **quali servizi si trovano più spesso
+> negli annunci con rating ≥ 4.9, con prezzo sopra il 75° percentile o sotto il 25°?**
+> Aggiungo `top_rating`, `prezzo_alto` e `prezzo_basso` come meta-item alle transazioni e cerco
+> le regole che li hanno come conseguente.
+
+```{r meta-items}
+# Soglie
+q25_prezzo <- quantile(airbnb_pulito$price_num, 0.25, na.rm = TRUE)
+q75_prezzo <- quantile(airbnb_pulito$price_num, 0.75, na.rm = TRUE)
+
+# Meta-item per ogni annuncio
+meta_items <- airbnb_pulito %>%
+  mutate(id = as.character(id)) %>%
+  filter(!is.na(amenities), amenities != "[]") %>%
+  select(id, price_num, review_scores_rating) %>%
+  mutate(
+    top_rating   = if_else(!is.na(review_scores_rating) & review_scores_rating >= 4.9,
+                           "top_rating", NA_character_),
+    prezzo_alto  = if_else(!is.na(price_num) & price_num > q75_prezzo,
+                           "prezzo_alto", NA_character_),
+    prezzo_basso = if_else(!is.na(price_num) & price_num < q25_prezzo,
+                           "prezzo_basso", NA_character_)
+  ) %>%
+  select(id, top_rating, prezzo_alto, prezzo_basso) %>%
+  pivot_longer(-id, values_to = "amenity", names_to = "tipo") %>%
+  filter(!is.na(amenity)) %>%
+  select(id, amenity)
+
+cat("Annunci con top_rating (≥ 4.9): ",
+    sum(airbnb_pulito$review_scores_rating >= 4.9, na.rm = TRUE), "\n")
+cat("Annunci con prezzo_alto  (> 75° pct =", round(q75_prezzo), "$): ",
+    sum(airbnb_pulito$price_num > q75_prezzo, na.rm = TRUE), "\n")
+cat("Annunci con prezzo_basso (< 25° pct =", round(q25_prezzo), "$): ",
+    sum(airbnb_pulito$price_num < q25_prezzo, na.rm = TRUE), "\n")
+
+# Transazioni estese (amenities + meta-item)
+am_ext <- bind_rows(am_long %>% select(id, amenity), meta_items)
+
+trans_ext_list <- split(am_ext$amenity, am_ext$id)
+trans_ext_list <- lapply(trans_ext_list, unique)
+trans_ext      <- as(trans_ext_list, "transactions")
+
+# Vettore di soli item "reali" (amenities), senza i tre meta-item.
+# Serve per impedire che top_rating/prezzo_alto/prezzo_basso compaiano
+# nel LHS delle regole: sarebbero circolari (i tre outcome sono correlati tra loro).
+solo_amenities <- setdiff(itemLabels(trans_ext),
+                          c("top_rating", "prezzo_alto", "prezzo_basso"))
+```
+
+## 6.1 Amenities → rating alto (≥ 4.9 ★)
+
+```{r regole-top-rating}
+regole_rating <- apriori(
+  trans_ext,
+  parameter  = list(supp = 0.05, conf = 0.55, minlen = 2),
+  appearance = list(lhs = solo_amenities, rhs = "top_rating")
+)
+cat("Regole trovate → top_rating:", length(regole_rating), "\n")
+
+regole_rating_ord <- sort(regole_rating, by = "lift")
+inspect(head(regole_rating_ord, n = 5))
+```
+
+```{r plot-rating, fig.height=5}
+if (length(regole_rating) > 0) {
+  p_rating <- plot_regole_lollipop(
+    regole_rating, n = 5,
+    titolo      = "Amenities associate a top rating (≥ 4.9 ★)",
+    sottotitolo = "cosa investire per salire al top"
+  )
+  print(p_rating)
+  salva("07a_amenities_top_rating_venezia", p_rating, h = 5.5,w=10)
+}
+```
+
+## 6.2 Amenities → prezzo alto (> 75° percentile)
+
+```{r regole-prezzo-alto}
+regole_prezzo <- apriori(
+  trans_ext,
+  parameter  = list(supp = 0.05, conf = 0.40, minlen = 2),
+  appearance = list(lhs = solo_amenities, rhs = "prezzo_alto")
+)
+cat("Regole trovate → prezzo_alto:", length(regole_prezzo), "\n")
+
+regole_prezzo_ord <- sort(regole_prezzo, by = "lift")
+inspect(head(regole_prezzo_ord, n = 5))
+```
+
+```{r plot-prezzo, fig.height=5}
+if (length(regole_prezzo) > 0) {
+  p_prezzo <- plot_regole_lollipop(
+    regole_prezzo, n = 5,
+    titolo      = "Amenities associate a prezzo alto (> 75° percentile)",
+    sottotitolo = "cosa giustifica tariffe premium"
+  )
+  print(p_prezzo)
+  salva("07b_amenities_prezzo_alto_venezia", p_prezzo, h = 5.5,w = 10)
+}
+```
+
+## 6.3 Amenities → prezzo basso (< 25° percentile)
+
+```{r regole-prezzo-basso}
+regole_prezzo_basso <- apriori(
+  trans_ext,
+  parameter  = list(supp = 0.03, conf = 0.30, minlen = 2),
+  appearance = list(lhs = solo_amenities, rhs = "prezzo_basso")
+)
+cat("Regole trovate → prezzo_basso:", length(regole_prezzo_basso), "\n")
+
+regole_prezzo_basso_ord <- sort(regole_prezzo_basso, by = "lift")
+inspect(head(regole_prezzo_basso_ord, n = 5))
+```
+
+```{r plot-prezzo-basso, fig.height=5}
+if (length(regole_prezzo_basso) > 0) {
+  p_prezzo_basso <- plot_regole_lollipop(
+    regole_prezzo_basso, n = 5,
+    titolo      = "Amenities associate a prezzo basso (< 25° percentile)",
+    sottotitolo = "profilo del segmento low-cost"
+  )
+  print(p_prezzo_basso)
+  salva("07c_amenities_prezzo_basso_venezia", p_prezzo_basso, h = 5.5, w=10)
+}
+```
+
+---
+
+---
+
+> **Interpretazione delle metriche** (come da lab):
+>
+> - **Support** = P(A ∩ B) → quanto spesso il bundle appare nel mercato
+> - **Confidence** = P(B | A) → se un annuncio ha A, quanto spesso ha anche B
+> - **Coverage** = P(A) → frequenza del lato sinistro
+> - **Lift** = P(B|A) / P(B) → quanto la presenza di A *aumenta* la probabilità di B
+>   rispetto al caso; **lift > 1 = co-occorrenza non casuale**
