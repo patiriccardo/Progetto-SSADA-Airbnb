@@ -1,6 +1,6 @@
 # Progetto SSADA – Analisi degli affitti brevi Airbnb a Venezia
 
-Progetto realizzato per il corso **Strumenti per l'Analisi dei Dati Aziendali (SSADA)** – Università Ca' Foscari Venezia, A.A. 2024/2025.
+Progetto realizzato per il corso **Strumenti per l'Analisi dei Dati Aziendali (SSADA)** – Università degli Studi di Padova, A.A. 2025/2026.
 
 L'obiettivo è analizzare il mercato degli affitti brevi Airbnb nella città di Venezia attraverso analisi descrittive, modellazione predittiva del prezzo, analisi di diffusione temporale, regole associative sulle amenities e visualizzazioni geospaziali.
 
