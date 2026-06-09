@@ -21,7 +21,6 @@ Progetto-SSADA-Airbnb/
 │   ├── pulizia_airroi.R              # Preprocessing del dataset AirROI
 │   ├── utils.R                       # Funzione MERT (Mixed Effects Regression Trees)
 │   ├── scraping_airbnb.py            # Web scraping prezzi Airbnb – Lido di Venezia
-│   ├── scraping_booking.py           # Web scraping prezzi Booking.com
 │   └── output_recensioni/            # Output analisi testuale delle recensioni
 ├── Modelli/                          # Cache e modelli addestrati (.rds)
 │   ├── modello_gam_finale.rds
@@ -155,7 +154,7 @@ source("Analisi/Mappe2.R")
 
 ## Web scraping (Python)
 
-Gli script `Analisi/scraping_airbnb.py` e `Analisi/scraping_booking.py` raccolgono prezzi da Airbnb e Booking.com tramite Selenium con interazione manuale.
+Lo script `Analisi/scraping_airbnb.py` raccoglie prezzi da Airbnb (Lido di Venezia) tramite Selenium con interazione manuale.
 
 **Requisiti:**
 
@@ -163,7 +162,7 @@ Gli script `Analisi/scraping_airbnb.py` e `Analisi/scraping_booking.py` raccolgo
 pip install selenium pandas webdriver-manager
 ```
 
-I dati prodotti dagli scraper sono già inclusi in `dati/` (`prezzi_airbnb_lido.csv`, `prezzi_lido_mostra_castello.csv`), quindi non è necessario rieseguirli.
+I dati prodotti dallo scraper sono già inclusi in `dati/` (`prezzi_airbnb_lido.csv`), quindi non è necessario rieseguirlo.
 
 ---
 
